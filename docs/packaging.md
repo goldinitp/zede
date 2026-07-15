@@ -16,6 +16,21 @@ so they can be `dlopen`'d at runtime.
 > Native modules must match Electron's ABI before packaging: `npm run rebuild`
 > (wraps `@electron/rebuild` for `better-sqlite3,node-pty`). Confirmed in M0.
 
+## Windows
+
+`electron-builder.yml` declares an NSIS target under `win:`. Because the native
+addons (`better-sqlite3`, `node-pty`) can't be cross-compiled from macOS, the
+Windows installer **must be built on Windows** — locally or via CI. The
+`.github/workflows/build-windows.yml` workflow does this on a `windows-latest`
+runner (`pnpm install` → `pnpm run rebuild` → `pnpm run dist`) and uploads the
+`.exe` as an artifact; it runs on `workflow_dispatch` and on `v*` tags.
+
+On Windows, `PtyManager.spawn` launches Windows PowerShell (`powershell.exe`,
+overridable via `ZEDE_SHELL`) instead of the POSIX login shell. GUI apps inherit
+the full user/system PATH on Windows, so no login-shell sourcing is needed; a
+claude tab runs `powershell -NoLogo -NoExit -Command "claude …"` so the shell
+stays interactive after claude exits, mirroring the POSIX `exec <shell> -il`.
+
 ## macOS signing + notarization
 
 `hardenedRuntime: true` + `build/entitlements.mac.plist` are set so a credentialed

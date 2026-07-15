@@ -84,30 +84,45 @@ export class PtyManager {
     }
 
     const { tabId, cwd, kind, autoClaude } = cfg
-    const shell = process.env.SHELL || '/bin/zsh'
-    // The id is interpolated into a `zsh -c` string and a transcript path below,
-    // so only a verified UUID may resume; anything else starts a fresh session.
+    const isWindows = process.platform === 'win32'
+    // Windows GUI apps inherit the full user/system PATH from the registry, so
+    // `claude` resolves without the login-shell dance macOS needs. Default to
+    // Windows PowerShell (5.1 — always present); pwsh/other shells opt in via
+    // ZEDE_SHELL. POSIX keeps zsh as the default login shell.
+    const shell = isWindows ? process.env.ZEDE_SHELL || 'powershell.exe' : process.env.SHELL || '/bin/zsh'
+    // The id is interpolated into a shell command string and a transcript path
+    // below, so only a verified UUID may resume; anything else starts fresh.
     const resumeId = cfg.resumeSessionId && isUuid(cfg.resumeSessionId) ? cfg.resumeSessionId : undefined
     const sessionId = resumeId ?? randomUUID()
     const runClaude = kind === 'claude' && autoClaude
 
-    // Interactive login shell so the user's rc file (PATH incl. ~/.local/bin) is
-    // sourced — that's how `claude` resolves when Electron is launched from the
-    // GUI with a bare PATH. `-i` is load-bearing, not decoration: zsh only reads
-    // .zshrc for INTERACTIVE shells, and a `-l -c` shell is login-but-not-
-    // interactive, so it reads only .zshenv/.zprofile/.zlogin — files most users
-    // don't have. Without `-i` the command dies as `command not found: claude`.
+    // On POSIX we need an interactive login shell so the user's rc file (PATH
+    // incl. ~/.local/bin) is sourced — that's how `claude` resolves when Electron
+    // is launched from the GUI with a bare PATH. `-i` is load-bearing, not
+    // decoration: zsh only reads .zshrc for INTERACTIVE shells, and a `-l -c`
+    // shell is login-but-not-interactive, so it reads only .zshenv/.zprofile/
+    // .zlogin — files most users don't have. Without `-i` the command dies as
+    // `command not found: claude`. PowerShell auto-sources its profile for an
+    // interactive session and inherits PATH, so no equivalent flags are needed.
     //
     // For a claude tab we run claude AS the shell's command rather than typing it
     // into the prompt after a fixed delay. Typing raced shell startup and silently
     // dropped the `--session-id` flag, so the real transcript landed under a
     // claude-assigned id that capture never watched (Memory pane stayed empty).
-    // Passing it via `-c` delivers the flag intact; `exec <shell> -il` afterwards
-    // drops to an interactive shell when claude exits so the tab stays usable.
+    // Passing it as the command delivers the flag intact; afterwards we drop to an
+    // interactive shell when claude exits so the tab stays usable — `exec <shell>
+    // -il` on POSIX, PowerShell's `-NoExit` on Windows.
     // (spec §6.1 deterministic binding + Adapter B injection.)
-    const flag = runClaude && cfg.appendSystemPromptFile ? ` --append-system-prompt-file ${shellQuote(cfg.appendSystemPromptFile)}` : ''
+    const flag = runClaude && cfg.appendSystemPromptFile ? ` --append-system-prompt-file ${shellQuote(cfg.appendSystemPromptFile, isWindows)}` : ''
     const idFlag = resumeId ? `--resume ${sessionId}` : `--session-id ${sessionId}`
-    const args = runClaude ? ['-i', '-l', '-c', `claude ${idFlag}${flag}; exec ${shell} -il`] : ['-l']
+    const claudeCmd = `claude ${idFlag}${flag}`
+    const args = isWindows
+      ? runClaude
+        ? ['-NoLogo', '-NoExit', '-Command', claudeCmd]
+        : ['-NoLogo']
+      : runClaude
+        ? ['-i', '-l', '-c', `${claudeCmd}; exec ${shell} -il`]
+        : ['-l']
     const pty = spawnPty(shell, args, {
       name: 'xterm-256color',
       cols: 80,
@@ -153,6 +168,8 @@ export class PtyManager {
   }
 }
 
-function shellQuote(p: string): string {
-  return `'${p.replace(/'/g, `'\\''`)}'`
+function shellQuote(p: string, isWindows = false): string {
+  // Both wrap in single quotes; the escape for an embedded quote differs.
+  // PowerShell: double the single quote (''). POSIX: close-escape-reopen ('\'').
+  return isWindows ? `'${p.replace(/'/g, `''`)}'` : `'${p.replace(/'/g, `'\\''`)}'`
 }
