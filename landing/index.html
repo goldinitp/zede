@@ -1,0 +1,375 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Zede — Arc-style Spaces for Claude Code, with every memory and skill in view</title>
+<meta name="description" content="Switch between Claude Code projects like Arc spaces, instead of hunting through terminal tabs. See every memory, skill, and plugin Claude has loaded, in one searchable panel." />
+<style>
+  :root {
+    --bg: #1e2228;
+    --bg-1: #22262d;
+    --chrome: #2c313a;
+    --titlebar: #343a45;
+    --text: #e6e9ef;
+    --text-2: #b6bcc7;
+    --text-3: #9aa2b1;
+    --muted: #6f7686;
+    --accent: #61afef;
+    --green: #98c379;
+    --amber: #e5c07b;
+    --red: #e06c75;
+    --hairline: rgba(255,255,255,0.08);
+  }
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0;
+    padding: 0;
+    background: var(--bg);
+    color: var(--text);
+    font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    line-height: 1.5;
+  }
+  code, .mono {
+    font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  }
+  a { color: inherit; }
+  .wrap {
+    max-width: 980px;
+    margin: 0 auto;
+    padding: 0 24px;
+  }
+
+  /* nav */
+  nav.wrap {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding-top: 24px;
+    padding-bottom: 24px;
+  }
+  .brand {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    font-weight: 600;
+    font-size: 18px;
+    letter-spacing: -0.01em;
+  }
+  .brand .dot { color: var(--accent); }
+  nav a.gh {
+    font-size: 14px;
+    color: var(--text-2);
+    text-decoration: none;
+    border: 1px solid var(--hairline);
+    padding: 8px 14px;
+    border-radius: 8px;
+  }
+  nav a.gh:hover { border-color: var(--accent); color: var(--text); }
+
+  /* hero */
+  header.hero {
+    padding: 56px 0 32px;
+    text-align: center;
+  }
+  header.hero h1 {
+    font-size: clamp(32px, 5vw, 52px);
+    margin: 0 0 16px;
+    letter-spacing: -0.02em;
+  }
+  header.hero h1 .lens { color: var(--accent); }
+  header.hero p.tagline {
+    font-size: 19px;
+    color: var(--text-2);
+    max-width: 560px;
+    margin: 0 auto 32px;
+  }
+  .cta-row {
+    display: flex;
+    gap: 14px;
+    justify-content: center;
+    flex-wrap: wrap;
+    margin-bottom: 12px;
+  }
+  .btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    padding: 12px 22px;
+    border-radius: 10px;
+    font-size: 15px;
+    font-weight: 600;
+    text-decoration: none;
+    border: 1px solid transparent;
+  }
+  .btn-primary {
+    background: var(--accent);
+    color: #14181d;
+  }
+  .btn-primary:hover { filter: brightness(1.08); }
+  .btn-secondary {
+    color: var(--text);
+    border-color: var(--hairline);
+    background: var(--bg-1);
+  }
+  .btn-secondary:hover { border-color: var(--accent); }
+  .platform-note {
+    font-size: 13px;
+    color: var(--muted);
+  }
+
+  /* demo */
+  section.demo {
+    padding: 16px 0 8px;
+  }
+  .video-frame { margin: 0; }
+  .video-ph {
+    aspect-ratio: 16 / 10;
+    border: 1px solid var(--hairline);
+    border-radius: 14px;
+    background: linear-gradient(180deg, var(--bg-1), var(--chrome));
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 18px;
+    box-shadow: 0 24px 70px -34px rgba(0,0,0,0.65);
+  }
+  .video-ph .play {
+    width: 68px;
+    height: 68px;
+    border-radius: 50%;
+    background: var(--accent);
+    color: #14181d;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 24px;
+    padding-left: 5px;
+  }
+  .video-ph .ph-label {
+    color: var(--muted);
+    font-size: 14px;
+    letter-spacing: 0.01em;
+  }
+
+  /* gallery */
+  section.gallery {
+    padding: 24px 0 40px;
+  }
+  section.gallery h2 {
+    text-align: center;
+    font-size: 28px;
+    margin: 0 0 48px;
+    letter-spacing: -0.01em;
+  }
+  .gallery-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+    gap: 28px;
+  }
+  .gallery-item img {
+    width: 100%;
+    display: block;
+    border-radius: 12px;
+    border: 1px solid var(--hairline);
+    box-shadow: 0 20px 60px -30px rgba(0,0,0,0.6);
+    margin-bottom: 14px;
+  }
+  .gallery-item p {
+    font-size: 14px;
+    color: var(--text-3);
+    margin: 0;
+    text-align: center;
+  }
+
+  /* features */
+  section.features {
+    padding: 88px 0 40px;
+  }
+  section.features h2 {
+    text-align: center;
+    font-size: 28px;
+    margin: 0 0 48px;
+    letter-spacing: -0.01em;
+  }
+  .grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+    gap: 24px;
+  }
+  .card {
+    background: var(--bg-1);
+    border: 1px solid var(--hairline);
+    border-radius: 12px;
+    padding: 24px;
+  }
+  .card .icon {
+    font-size: 20px;
+    margin-bottom: 12px;
+    display: inline-block;
+  }
+  .card h3 {
+    font-size: 16px;
+    margin: 0 0 8px;
+  }
+  .card p {
+    font-size: 14px;
+    color: var(--text-3);
+    margin: 0;
+  }
+
+  /* download */
+  section.download {
+    padding: 72px 0;
+    text-align: center;
+  }
+  section.download .panel {
+    background: var(--bg-1);
+    border: 1px solid var(--hairline);
+    border-radius: 16px;
+    padding: 48px 24px;
+  }
+  section.download h2 {
+    font-size: 26px;
+    margin: 0 0 12px;
+  }
+  section.download p {
+    color: var(--text-3);
+    margin: 0 0 28px;
+  }
+  .also {
+    margin-top: 20px;
+    font-size: 13px;
+    color: var(--muted);
+  }
+  .also a { color: var(--text-2); text-decoration: underline; }
+
+  footer {
+    padding: 40px 0 60px;
+    text-align: center;
+    color: var(--muted);
+    font-size: 13px;
+    border-top: 1px solid var(--hairline);
+    margin-top: 40px;
+  }
+  footer a { color: var(--text-3); text-decoration: none; }
+  footer a:hover { color: var(--accent); }
+</style>
+</head>
+<body>
+
+<nav class="wrap">
+  <div class="brand"><span class="dot mono">&gt;_</span> Zede</div>
+  <a class="gh" href="https://github.com/goldinitp/zede" target="_blank" rel="noopener">GitHub</a>
+</nav>
+
+<header class="hero wrap">
+  <h1>Stop losing track of your <span class="lens">Claude</span> sessions</h1>
+  <p class="tagline">
+    Arc-style Spaces for switching between projects without the tab hunt,
+    plus one place to see every memory, skill, and plugin Claude has loaded.
+  </p>
+  <div class="cta-row">
+    <a class="btn btn-primary" href="https://github.com/goldinitp/zede#recommended-clone-and-build" target="_blank" rel="noopener">
+      Build from source
+    </a>
+    <a class="btn btn-secondary" href="https://github.com/goldinitp/zede/releases/latest" target="_blank" rel="noopener">
+      Download for Mac
+    </a>
+  </div>
+  <div class="platform-note">Free and open source (MIT) · macOS today, Windows/Linux on the roadmap · no Apple signing yet, so building from source is the clean install</div>
+</header>
+
+<section class="demo wrap">
+  <!-- Demo video slot. Replace this <figure> with a real player once a recording exists, e.g.:
+       <video class="video-frame" controls playsinline poster="assets/screenshot-main.png" width="932">
+         <source src="assets/demo.mp4" type="video/mp4" />
+       </video> -->
+  <figure class="video-frame">
+    <div class="video-ph">
+      <span class="play" aria-hidden="true">▶</span>
+      <span class="ph-label">Demo video coming soon</span>
+    </div>
+  </figure>
+</section>
+
+<section class="gallery wrap">
+  <div class="gallery-grid">
+    <div class="gallery-item">
+      <img src="assets/screenshot-main.png" alt="Zede main window: Spaces sidebar, terminal session, and Claude Context panel" width="924" loading="lazy" />
+      <p>Working on five projects at once? Switch Spaces instead of hunting through terminal tabs.</p>
+    </div>
+    <div class="gallery-item">
+      <img src="assets/screenshot-context.png" alt="Editing a skill file inside Zede, next to the Claude Context panel" width="924" loading="lazy" />
+      <p>Most people have no idea what memory, skills, or plugins Claude has loaded. Now you can see — and edit — all of it.</p>
+    </div>
+  </div>
+</section>
+
+<section class="features wrap">
+  <h2>What it does</h2>
+  <div class="grid">
+    <div class="card">
+      <span class="icon">🗂️</span>
+      <h3>Arc-style Spaces</h3>
+      <p>Working across several projects back-to-back is tedious in a normal terminal. Zede groups sessions into Spaces you switch instantly, the way Arc groups browser tabs.</p>
+    </div>
+    <div class="card">
+      <span class="icon">🔎</span>
+      <h3>See what Claude actually knows</h3>
+      <p>Claude Code carries memory, skills, plugins, and MCP tools across layers most people never see. Zede surfaces all of it, searchable, in one sidebar — so managing it isn't guesswork anymore.</p>
+    </div>
+    <div class="card">
+      <span class="icon">🧠</span>
+      <h3>Memory that stays</h3>
+      <p>Zede quietly distills facts, decisions, and preferences from your sessions into local, searchable memory — so context survives restarts.</p>
+    </div>
+    <div class="card">
+      <span class="icon">🔒</span>
+      <h3>Local-first</h3>
+      <p>Everything lives in a SQLite database on your own disk. Nothing is sent anywhere else, and you can delete it any time.</p>
+    </div>
+    <div class="card">
+      <span class="icon">🔁</span>
+      <h3>Set up one Mac, use it everywhere</h3>
+      <p>Claude's context normally lives and dies on a single machine. Zede syncs your memories, Spaces, and preferences to every Mac you use — through a private GitHub repo you own. No vendor server, and every synced file is plain markdown you can read.</p>
+    </div>
+    <div class="card">
+      <span class="icon">📌</span>
+      <h3>Pick up where you left off</h3>
+      <p>Quit the app and reopen it: pinned tabs resume their last Claude session automatically. You can also save any conversation as a local snapshot and load it back later, context intact.</p>
+    </div>
+  </div>
+</section>
+
+<section class="download wrap">
+  <div class="panel">
+    <h2>Get Zede</h2>
+    <p>Building from source is the recommended path — there's no Apple signing yet, so a locally built app just opens.</p>
+    <div class="cta-row">
+      <a class="btn btn-primary" href="https://github.com/goldinitp/zede#recommended-clone-and-build" target="_blank" rel="noopener">
+        Clone &amp; build
+      </a>
+      <a class="btn btn-secondary" href="https://github.com/goldinitp/zede/releases/latest" target="_blank" rel="noopener">
+        Download a prebuilt release
+      </a>
+    </div>
+    <div class="also">
+      Three commands: <code class="mono">git clone … &amp;&amp; pnpm install &amp;&amp; pnpm dist</code> —
+      full steps in the <a href="https://github.com/goldinitp/zede#recommended-clone-and-build" target="_blank" rel="noopener">README</a>.
+    </div>
+    <div class="also">
+      Prefer the prebuilt download? macOS blocks it on first launch because Zede isn't notarized by Apple yet.
+      One command clears it: <code class="mono">xattr -cr /Applications/Zede.app</code> —
+      <a href="https://github.com/goldinitp/zede#alternative-download-a-prebuilt-release" target="_blank" rel="noopener">why, and other options</a>.
+    </div>
+  </div>
+</section>
+
+<footer class="wrap">
+  MIT licensed · <a href="https://github.com/goldinitp/zede" target="_blank" rel="noopener">github.com/goldinitp/zede</a>
+</footer>
+
+</body>
+</html>
