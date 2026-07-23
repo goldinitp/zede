@@ -110,7 +110,7 @@ export function TabBar({
     { label: 'Rename…', onClick: () => onRename(t) },
     { label: 'Duplicate', onClick: () => onDuplicate(t) },
     { label: 'Copy working directory', onClick: () => navigator.clipboard?.writeText(t.cwd) },
-    ...(t.kind === 'claude'
+    ...(t.kind === 'claude' || t.kind === 'shell'
       ? [{ label: 'Save conversation', hint: 'to local JSON', onClick: () => onSaveConversation(t) } as MenuEntry]
       : []),
     {

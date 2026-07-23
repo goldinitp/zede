@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useState, type KeyboardEvent, type PointerEvent, type ReactNode } from 'react'
-import type { ClaudeInternalItem, ClaudeInternalKind, ForgottenItem, InjectionPreview, Memory, MemoryType, Space } from '@shared/api'
+import type { ChatPrompt, ClaudeInternalItem, ClaudeInternalKind, ForgottenItem, InjectionPreview, Memory, MemoryType, Space, TabPrompts } from '@shared/api'
 import { IconChevronRight } from '../ui/icons'
+import { promptNeedle } from '../terminal/jump'
 import { compareByScopeHierarchy, scopeInfo } from './scope'
 
 /* One collapsible section per kind of context, internals first, then memory
@@ -46,7 +47,17 @@ const byScopeThenRecency = (a: Memory, b: Memory): number => {
 const byScopeThenName = (a: ClaudeInternalItem, b: ClaudeInternalItem): number =>
   scopeInfo(a.scope).rank - scopeInfo(b.scope).rank || a.name.localeCompare(b.name)
 
+/** Compact time hint for a prompt row: clock time today, date otherwise. */
+function promptTime(ts: number): string {
+  const d = new Date(ts)
+  return d.toDateString() === new Date().toDateString()
+    ? d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+    : d.toLocaleDateString([], { month: 'short', day: 'numeric' })
+}
+
 interface Props {
+  /** Visibility — the panel stays mounted while closed so reopening paints instantly. */
+  open: boolean
   spaceId: string
   spaces: Space[]
   notify: (t: { id: string; content: string }) => void
@@ -54,13 +65,16 @@ interface Props {
   onOpen: (m: Memory) => void
   /** Open a skill / plugin / MCP server / tool in its own editable tab. */
   onOpenInternal: (item: ClaudeInternalItem) => void
+  /** Jump to a prompt: activate its chat tab and scroll the terminal there. */
+  onJumpPrompt: (p: { tabId: string; text: string; occurrence: number }) => void
   onStartResize?: (e: PointerEvent<HTMLDivElement>) => void
   onResizeKeyDown?: (e: KeyboardEvent<HTMLDivElement>) => void
 }
 
-export function MemorySidebar({ spaceId, spaces, notify, onOpen, onOpenInternal, onStartResize, onResizeKeyDown }: Props) {
+export function MemorySidebar({ open, spaceId, spaces, notify, onOpen, onOpenInternal, onJumpPrompt, onStartResize, onResizeKeyDown }: Props) {
   const [memories, setMemories] = useState<Memory[]>([])
   const [internals, setInternals] = useState<ClaudeInternalItem[]>([])
+  const [prompts, setPrompts] = useState<TabPrompts[]>([])
   const [justLearned, setJustLearned] = useState<Set<string>>(new Set())
   const [query, setQuery] = useState('')
   const [preview, setPreview] = useState<InjectionPreview | null>(null)
@@ -74,11 +88,16 @@ export function MemorySidebar({ spaceId, spaces, notify, onOpen, onOpenInternal,
   const [showForgotten, setShowForgotten] = useState(false)
   const [forgotten, setForgotten] = useState<ForgottenItem[]>([])
 
+  const refreshPrompts = useCallback(() => {
+    window.zede.prompts.list(spaceId).then(setPrompts)
+  }, [spaceId])
+
   const refresh = useCallback(() => {
     window.zede.memory.list(spaceId).then(setMemories)
     window.zede.memory.preview(spaceId).then(setPreview)
     window.zede.internals.list(spaceId).then((snapshot) => setInternals(snapshot.items))
-  }, [spaceId])
+    refreshPrompts()
+  }, [spaceId, refreshPrompts])
 
   useEffect(() => {
     refresh()
@@ -110,6 +129,26 @@ export function MemorySidebar({ spaceId, spaces, notify, onOpen, onOpenInternal,
     if (showForgotten) window.zede.memory.recentlyForgotten(spaceId).then(setForgotten)
   }, [showForgotten, spaceId, memories])
 
+  // Keep the Prompts section current while the panel is showing: a submitted
+  // prompt reaches the transcript as its answer starts streaming, so refetch
+  // once PTY output goes quiet (trailing debounce — main's mtime cache makes
+  // the refetch cheap when nothing changed). Also on tab create/close/rename.
+  useEffect(() => {
+    if (!open) return
+    refreshPrompts()
+    let timer: number | undefined
+    const offData = window.zede.pty.onData(() => {
+      if (timer) window.clearTimeout(timer)
+      timer = window.setTimeout(refreshPrompts, 1000)
+    })
+    const offTab = window.zede.tab.onChanged(() => refreshPrompts())
+    return () => {
+      offData()
+      offTab()
+      if (timer) window.clearTimeout(timer)
+    }
+  }, [open, refreshPrompts])
+
   const filtered = useMemo(() => {
     const q = query.trim().toLowerCase()
     return q ? memories.filter((m) => m.content.toLowerCase().includes(q)) : memories
@@ -132,6 +171,27 @@ export function MemorySidebar({ spaceId, spaces, notify, onOpen, onOpenInternal,
     }
     return g
   }, [filteredInternals])
+
+  // Filtered prompt view, keeping each prompt's index in the FULL per-tab list
+  // so occurrence counting (for the buffer jump) ignores the filter.
+  const promptView = useMemo(() => {
+    const q = query.trim().toLowerCase()
+    return prompts
+      .map((g) => ({
+        ...g,
+        prompts: g.prompts.map((p, idx) => ({ ...p, idx })).filter((p) => !q || p.text.toLowerCase().includes(q))
+      }))
+      .filter((g) => g.prompts.length > 0)
+  }, [prompts, query])
+  const promptCount = useMemo(() => promptView.reduce((n, g) => n + g.prompts.length, 0), [promptView])
+
+  const jumpPrompt = (tabId: string, p: ChatPrompt & { idx: number }): void => {
+    const all = prompts.find((g) => g.tabId === tabId)?.prompts ?? []
+    const needle = promptNeedle(p.text)
+    // nth rendering of this exact needle in the chat = how many earlier prompts share it
+    const occurrence = all.slice(0, p.idx).filter((q) => promptNeedle(q.text) === needle).length
+    onJumpPrompt({ tabId, text: p.text, occurrence })
+  }
 
   const memoriesByType = useMemo(() => {
     const g = new Map<MemoryType, Memory[]>()
@@ -185,7 +245,7 @@ export function MemorySidebar({ spaceId, spaces, notify, onOpen, onOpenInternal,
   }
 
   return (
-    <aside className="memory">
+    <aside className="memory" style={{ display: open ? undefined : 'none' }}>
       <div
         className="memory-resizer"
         role="separator"
@@ -206,12 +266,39 @@ export function MemorySidebar({ spaceId, spaces, notify, onOpen, onOpenInternal,
 
       <input className="memory-search" placeholder="Filter" value={query} onChange={(e) => setQuery(e.target.value)} />
 
-      {filtered.length === 0 && filteredInternals.length === 0 && (
+      {filtered.length === 0 && filteredInternals.length === 0 && promptView.length === 0 && (
         <div className="empty">
-          {memories.length === 0 && internals.length === 0
+          {memories.length === 0 && internals.length === 0 && prompts.length === 0
             ? 'No Claude context found yet. Memories, skills, plugins and MCP tools will appear here as they are discovered.'
             : 'No Claude context matches your filter.'}
         </div>
+      )}
+
+      {promptView.length > 0 && (
+        <section className="group context-section">
+          {sectionHead('prompts', 'Prompts', promptCount)}
+          {isOpen('prompts') &&
+            promptView.map((g) => (
+              <div key={g.tabId}>
+                {promptView.length > 1 && <div className="prompt-group">{g.tabTitle}</div>}
+                {g.prompts.map((p) => (
+                  <div
+                    key={p.idx}
+                    className="ctx-row prompt-row"
+                    role="button"
+                    tabIndex={0}
+                    title={`${p.text}\n\nClick to jump to this prompt in the chat`}
+                    onClick={() => jumpPrompt(g.tabId, p)}
+                    onKeyDown={(e) => e.key === 'Enter' && jumpPrompt(g.tabId, p)}
+                  >
+                    <span className="prompt-mark">›</span>
+                    <span className="ctx-name">{p.text}</span>
+                    {p.ts !== null && <span className="ctx-scope">{promptTime(p.ts)}</span>}
+                  </div>
+                ))}
+              </div>
+            ))}
+        </section>
       )}
 
       {INTERNAL_SECTIONS.map(({ kind, label }) => {

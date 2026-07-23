@@ -13,7 +13,7 @@ import { HashingEmbedder, cosine } from './embed/embedder'
 import { HeuristicExtractor } from './extract/heuristic'
 import { fingerprint } from './pipeline/fingerprint'
 import { redact } from './pipeline/redact'
-import { recordsToSpan, recordsToSpans, readFrom } from './capture/parser'
+import { recordsToSpan, recordsToSpans, readFrom, userPrompts } from './capture/parser'
 import { CaptureService } from './capture/watcher'
 import { ConversationStore } from './conversations/store'
 import { FORMAT_VERSION, exportTree, parseMemoryFile, serializeMemory, type SyncedMemory } from './sync/format'
@@ -340,6 +340,35 @@ export async function runSelfTest(): Promise<boolean> {
   core.setSettings({ restorePinnedSessions: true })
   core.repo.insertSession({ id: 'restore-2', tabId: rTabId, ccSessionId: 'restore-2', transcriptPath: join(dir, 'gone.jsonl'), startedAt: Date.now() + 1000, status: 'live' })
   check('restore: pruned transcript falls back to a fresh session', core.resumeCandidateFor(rTab()) === undefined)
+
+  // --- chat prompt navigator (sidebar Prompts section) ---
+  const pTabId = 'prompt-nav'
+  core.repo.createTab({ id: pTabId, spaceId: 'default', kind: 'claude', title: 'chat', cwd: process.cwd(), now: Date.now() })
+  const pTranscript = join(dir, 'prompts-transcript.jsonl')
+  writeFileSync(
+    pTranscript,
+    [
+      JSON.stringify({ type: 'user', timestamp: '2026-07-23T10:00:00Z', message: { role: 'user', content: 'Fix the login bug' } }),
+      JSON.stringify({ type: 'assistant', message: { role: 'assistant', content: [{ type: 'text', text: 'On it.' }] } }),
+      JSON.stringify({ type: 'user', isMeta: true, message: { role: 'user', content: 'META NOISE' } }),
+      JSON.stringify({ type: 'user', message: { role: 'user', content: '<command-name>/clear</command-name>' } }),
+      JSON.stringify({ type: 'user', message: { role: 'user', content: '<local-command-stdout>ran</local-command-stdout>' } }),
+      JSON.stringify({ type: 'user', message: { role: 'user', content: [{ type: 'tool_result', content: 'tool output' }] } }),
+      JSON.stringify({ type: 'user', isSidechain: true, message: { role: 'user', content: 'subagent prompt' } }),
+      JSON.stringify({ type: 'user', message: { role: 'user', content: [{ type: 'text', text: 'Now add tests' }] } }),
+      ''
+    ].join('\n')
+  )
+  core.repo.insertSession({ id: 'pnav-1', tabId: pTabId, ccSessionId: 'pnav-1', transcriptPath: pTranscript, startedAt: Date.now(), status: 'live' })
+  const pure = userPrompts(readFileSync(pTranscript, 'utf8'))
+  check('prompts: parser keeps real user prompts in order', pure.map((p) => p.text).join('|') === 'Fix the login bug|Now add tests')
+  check('prompts: parser stamps recorded timestamps', pure[0]?.ts === Date.parse('2026-07-23T10:00:00Z') && pure[1]?.ts === null)
+  check('prompts: parser caps a giant paste', userPrompts(JSON.stringify({ type: 'user', message: { role: 'user', content: 'y'.repeat(9000) } }))[0]?.text.length === 400)
+  const pGroups = core.listPrompts('default')
+  const pChat = pGroups.find((g) => g.tabId === pTabId)
+  check('prompts: listPrompts groups the chat under its tab', pChat?.tabTitle === 'chat' && pChat?.prompts.length === 2)
+  check('prompts: pruned/missing transcript yields no group', pGroups.every((g) => g.tabId !== rTabId))
+  check('prompts: unchanged transcript served from cache', !!pChat && core.listPrompts('default').find((g) => g.tabId === pTabId)?.prompts === pChat.prompts)
 
   // --- M4: export ---
   const md = core.exportAll('default', 'markdown')

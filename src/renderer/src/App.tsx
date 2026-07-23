@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState, type CSSProperties, type PointerEvent as ReactPointerEvent } from 'react'
 import type { ClaudeInternalItem, Memory, SavedConversation, Settings, Space, Tab, TabKind } from '@shared/api'
 import { TerminalPane } from './terminal/Terminal'
+import { jumpTerminalToPrompt } from './terminal/jump'
 import { applyAppearance } from './ui/appearance'
 import { MemorySidebar } from './memory/MemorySidebar'
 import { MemoryDetailPane } from './memory/MemoryDetail'
@@ -360,6 +361,18 @@ export default function App() {
       ]
     }))
   }
+  // Jump from a sidebar prompt to its spot in the chat: activate the tab, then
+  // scroll once the pane has refit (activation triggers a fit + PTY resize, so
+  // an immediate scroll would race the re-wrap). Already-active tabs jump fast.
+  const jumpToPrompt = useCallback((p: { tabId: string; text: string; occurrence: number }): void => {
+    const already = activeTabRef.current === p.tabId
+    if (!already) setActiveTab(p.tabId)
+    window.setTimeout(() => {
+      if (!jumpTerminalToPrompt(p.tabId, p.text, p.occurrence))
+        setToast({ id: `prompt-jump-${p.tabId}`, kind: 'info', content: 'That prompt is no longer in the terminal scrollback' })
+    }, already ? 50 : 350)
+  }, [])
+
   // Drag-and-drop reorder/pin. Apply optimistically (no flash) so the row jumps
   // under the cursor immediately, then persist; the tab:changed reload confirms it.
   const reorderTabs = async (orderedIds: string[], pinnedChange?: { id: string; pinned: boolean }): Promise<void> => {
@@ -513,31 +526,36 @@ export default function App() {
           </div>
         </main>
 
-        {memoryOpen && activeSpace && (
+        {/* Kept mounted while closed (display:none, like TerminalPane) so ⌘M
+            shows an already-populated panel instantly instead of remounting,
+            refetching and flashing the empty state. */}
+        {activeSpace && (
           <MemorySidebar
-          spaceId={activeSpace}
-          spaces={spaces}
-          notify={setToast}
-          onOpen={openMemory}
-          onOpenInternal={openInternal}
-          onStartResize={startMemoryResize}
-          onResizeKeyDown={(e) => {
-            if (e.key === 'ArrowLeft') {
-              e.preventDefault()
-              resizeMemoryBy(e.shiftKey ? 40 : 12)
-            } else if (e.key === 'ArrowRight') {
-              e.preventDefault()
-              resizeMemoryBy(e.shiftKey ? -40 : -12)
-            } else if (e.key === 'Home') {
-              e.preventDefault()
-              setMemoryWidth(MEMORY_MIN_WIDTH)
-            } else if (e.key === 'End') {
-              e.preventDefault()
-              setMemoryWidth(memoryMaxWidth())
-            }
-          }}
-        />
-      )}
+            open={memoryOpen}
+            spaceId={activeSpace}
+            spaces={spaces}
+            notify={setToast}
+            onOpen={openMemory}
+            onOpenInternal={openInternal}
+            onJumpPrompt={jumpToPrompt}
+            onStartResize={startMemoryResize}
+            onResizeKeyDown={(e) => {
+              if (e.key === 'ArrowLeft') {
+                e.preventDefault()
+                resizeMemoryBy(e.shiftKey ? 40 : 12)
+              } else if (e.key === 'ArrowRight') {
+                e.preventDefault()
+                resizeMemoryBy(e.shiftKey ? -40 : -12)
+              } else if (e.key === 'Home') {
+                e.preventDefault()
+                setMemoryWidth(MEMORY_MIN_WIDTH)
+              } else if (e.key === 'End') {
+                e.preventDefault()
+                setMemoryWidth(memoryMaxWidth())
+              }
+            }}
+          />
+        )}
       </div>
 
       <Toast toast={toast} onUndo={undo} onDismiss={() => setToast(null)} />

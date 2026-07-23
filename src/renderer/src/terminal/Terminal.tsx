@@ -1,8 +1,10 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { Terminal } from '@xterm/xterm'
 import { FitAddon } from '@xterm/addon-fit'
+import { WebglAddon } from '@xterm/addon-webgl'
 import type { Settings } from '@shared/api'
 import { getTheme } from '@shared/themes'
+import { promptNeedle, registerPromptJumper } from './jump'
 import '@xterm/xterm/css/xterm.css'
 
 /** Turn appearance settings into xterm options (theme palette + alpha bg). */
@@ -112,6 +114,16 @@ export function TerminalPane({
     const fit = new FitAddon()
     term.loadAddon(fit)
     term.open(host)
+    // GPU renderer: the default DOM renderer is the biggest drag on redraw and
+    // scroll speed. Best-effort — a machine without WebGL (or a lost context)
+    // falls back to the DOM renderer.
+    try {
+      const webgl = new WebglAddon()
+      webgl.onContextLoss(() => webgl.dispose())
+      term.loadAddon(webgl)
+    } catch {
+      /* WebGL unavailable — DOM renderer fallback */
+    }
     fit.fit()
     termRef.current = term
     fitRef.current = fit
@@ -132,6 +144,39 @@ export function TerminalPane({
       setExited(true)
     })
     term.onData((d) => window.zede.pty.input(tabId, d))
+
+    // Prompt navigator jump: scan the buffer for the prompt's needle, scroll
+    // there and select it. The TUI can echo the same text more than once, so
+    // land on the nth match — clamped to the last one so a history that has
+    // partially scrolled out of the buffer still jumps somewhere close.
+    const offJump = registerPromptJumper(tabId, (text, occurrence) => {
+      const needle = promptNeedle(text)
+      if (!needle) return false
+      const buf = term.buffer.active
+      const matches: { row: number; col: number }[] = []
+      for (let i = 0; i < buf.length; i++) {
+        const col = (buf.getLine(i)?.translateToString(true) ?? '').indexOf(needle)
+        if (col !== -1) matches.push({ row: i, col })
+      }
+      if (!matches.length) return false
+      const m = matches[Math.min(occurrence, matches.length - 1)]
+      term.scrollToLine(Math.max(0, m.row - 1))
+      term.select(m.col, m.row, needle.length)
+      return true
+    })
+
+    // Shift+Enter must insert a newline in Claude Code with zero user setup.
+    // Terminals send the same CR for Enter and Shift+Enter, so translate
+    // Shift+Enter to LF (^J): Claude Code's default chat:newline binding,
+    // while shells treat LF identically to Enter — safe in plain shell tabs.
+    // Block keypress/keyup too so xterm never emits its own CR for the chord.
+    term.attachCustomKeyEventHandler((ev) => {
+      if (ev.key === 'Enter' && ev.shiftKey && !ev.ctrlKey && !ev.altKey && !ev.metaKey) {
+        if (ev.type === 'keydown') window.zede.pty.input(tabId, '\n')
+        return false
+      }
+      return true
+    })
 
     // Re-attach to the PTY. Only bridge with the saved scrollback when spawn
     // re-attached to a still-live PTY (a Space switch within one run) — there the
@@ -165,6 +210,7 @@ export function TerminalPane({
       disposed = true
       offData()
       offExit()
+      offJump()
       ro.disconnect()
       // Snapshot for visual restore; do NOT kill — the PTY persists across switches.
       window.zede.pty.snapshot(tabId, { scrollback: serialize(term), cols: term.cols, rows: term.rows })

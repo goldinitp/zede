@@ -69,6 +69,38 @@ export function textFromContent(content: unknown): string {
   return ''
 }
 
+// Noise the TUI records as `user` turns that were never typed as prompts:
+// slash-command wrappers, local command output, caveat banners, interrupts.
+const PROMPT_NOISE = /^(<command-name>|<command-message>|<local-command-stdout>|<local-command-stderr>|\[Request interrupted|Caveat: The messages below)/
+
+const MAX_PROMPT = 400
+
+export interface UserPrompt {
+  text: string
+  ts: number | null
+}
+
+/** The user's actual prompts in a transcript, in conversation order. Tool
+ *  results drop out naturally (textFromContent reads text blocks only). */
+export function userPrompts(transcript: string): UserPrompt[] {
+  const out: UserPrompt[] = []
+  for (const line of transcript.split('\n')) {
+    if (!line) continue
+    let r: TranscriptRecord
+    try {
+      r = JSON.parse(line) as TranscriptRecord
+    } catch {
+      continue
+    }
+    if (r.type !== 'user' || r.isMeta || r.isSidechain) continue
+    const text = textFromContent(r.message?.content).trim()
+    if (!text || PROMPT_NOISE.test(text)) continue
+    const ts = r.timestamp ? Date.parse(r.timestamp) : NaN
+    out.push({ text: text.slice(0, MAX_PROMPT), ts: Number.isFinite(ts) ? ts : null })
+  }
+  return out
+}
+
 // Turn conversation records into per-message lines. Drops meta / sidechain /
 // tool records and caps each message so a giant paste never dominates a span.
 function recordParts(records: TranscriptRecord[]): string[] {

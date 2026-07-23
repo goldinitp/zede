@@ -143,6 +143,21 @@ export interface SavedConversation {
   filePath: string
 }
 
+// --- chat prompt navigator (sidebar "Prompts" section) ---
+/** One user prompt from a chat's transcript, in conversation order. */
+export interface ChatPrompt {
+  /** Prompt text, capped so a giant paste can't flood the sidebar. */
+  text: string
+  /** Wall-clock time the prompt was sent, when the transcript records it. */
+  ts: number | null
+}
+/** All prompts of one chat tab, for the sidebar's per-chat grouping. */
+export interface TabPrompts {
+  tabId: string
+  tabTitle: string
+  prompts: ChatPrompt[]
+}
+
 // --- PTY ---
 export interface PtySpawnOptions {
   tabId: string
@@ -334,6 +349,11 @@ export interface ZedeApi {
      *  With `compact`, `/compact` is sent once the resumed session settles. */
     load(id: string, opts?: { spaceId?: string; compact?: boolean }): Promise<Tab>
     delete(id: string): Promise<boolean>
+  }
+  prompts: {
+    /** Every user prompt in each of the Space's chats, grouped per tab —
+     *  read from the tab's transcript (live session or last recorded one). */
+    list(spaceId: string): Promise<TabPrompts[]>
   }
   internals: {
     /** Local Claude/Cursor internals visible to this Space: skills, plugins, MCP servers and tools. */

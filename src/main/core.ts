@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto'
 import { basename, dirname, join } from 'node:path'
-import { existsSync, lstatSync, readFileSync, writeFileSync } from 'node:fs'
+import { existsSync, lstatSync, readFileSync, statSync, writeFileSync } from 'node:fs'
 import { dialog, safeStorage, shell, type WebContents } from 'electron'
 import { openDatabase } from './db/database'
 import { MemoryRepo } from './db/memories'
@@ -10,6 +10,7 @@ import { HeuristicExtractor } from './extract/heuristic'
 import { OllamaExtractor } from './extract/ollama'
 import type { Extractor } from './extract/types'
 import { CaptureService } from './capture/watcher'
+import { userPrompts, type UserPrompt } from './capture/parser'
 import { ConversationStore } from './conversations/store'
 import { MirrorService, MIRROR_ID_PREFIX } from './memory/mirror'
 import { SyncService } from './sync/service'
@@ -36,7 +37,8 @@ import type {
   Space,
   Tab,
   TabCreateOptions,
-  TabKind
+  TabKind,
+  TabPrompts
 } from '../shared/api'
 
 const DEFAULT_SPACE = { id: 'default', name: 'Default', icon: '🧵' }
@@ -57,6 +59,11 @@ export class Core {
   private readonly inject = new ContextWriter()
   private extractor: Extractor = new ClaudeCodeExtractor()
   private embedder: Embedder = new HashingEmbedder()
+  /** discoverClaudeInternals is a synchronous ~/.claude + per-cwd filesystem
+   *  sweep — too heavy to run on every memory:changed re-list from the panel
+   *  (it blocks the main process, and with it every IPC including pty data).
+   *  A short TTL keeps it off the hot path; internalSave invalidates. */
+  private internalsCache: { key: string; at: number; snap: ClaudeInternalsSnapshot } | null = null
 
   constructor(
     dbPath: string,
@@ -310,9 +317,13 @@ export class Core {
 
     const settings = this.getSettings()
     let appendFile: string | undefined
-    if (tab.kind === 'claude' && !this.pty.has(tab.id)) {
+    // Shell tabs get the file-adapter artifact too: a `claude` the user starts
+    // by hand in that cwd imports the same context via CLAUDE.md. (The flag
+    // adapter can't reach a manual start — nothing appends the flag for it.)
+    const wantsInjection = tab.kind === 'claude' || (tab.kind === 'shell' && settings.injectionAdapter === 'file')
+    if (wantsInjection && !this.pty.has(tab.id)) {
       const { contextPath } = await this.writeInjection(tab.spaceId, tab.cwd)
-      appendFile = settings.injectionAdapter === 'flag' ? contextPath : undefined
+      appendFile = tab.kind === 'claude' && settings.injectionAdapter === 'flag' ? contextPath : undefined
     }
 
     // A pinned tab's first spawn this run picks its previous session back up —
@@ -338,9 +349,13 @@ export class Core {
         startedAt: Date.now(),
         status: 'live'
       })
+    }
+    if (res.fresh && (tab.kind === 'claude' || tab.kind === 'shell')) {
       // Capture is bound to the cwd's transcript dir, not this one session — so a
       // tab the user never types into doesn't matter, and conversations run in an
       // external terminal (or a manually restarted `claude`) are captured too.
+      // Shell tabs count: a `claude` the user starts by hand inside one writes to
+      // the same transcript dir, and the watcher binds its session to this tab.
       this.capture.trackProject(tab.spaceId, tab.cwd, tab.id)
     }
     return { sessionId: res.sessionId, fresh: res.fresh }
@@ -362,11 +377,12 @@ export class Core {
   }
 
   /** Start project-dir capture for every distinct cwd among a Space's claude
-   *  tabs, backfilling transcripts already on disk. Idempotent. */
+   *  AND shell tabs (a `claude` started by hand in a shell tab must be captured
+   *  too), backfilling transcripts already on disk. Idempotent. */
   activateCapture(spaceId: string): void {
     const seen = new Set<string>()
     for (const t of this.repo.listTabs(spaceId)) {
-      if (t.kind !== 'claude' || seen.has(t.cwd)) continue
+      if ((t.kind !== 'claude' && t.kind !== 'shell') || seen.has(t.cwd)) continue
       seen.add(t.cwd)
       this.capture.trackProject(spaceId, t.cwd, t.id)
       this.mirror.track(spaceId, t.cwd) // mirror Claude Code's curated memory for this cwd
@@ -448,7 +464,14 @@ export class Core {
   // --- memory ops ---
   listInternals(spaceId: string): ClaudeInternalsSnapshot {
     const cwds = [process.cwd(), ...this.repo.listTabs(spaceId).map((t) => t.cwd)]
-    return discoverClaudeInternals({ cwds, now: Date.now() })
+    const key = cwds.join(' ')
+    const now = Date.now()
+    if (this.internalsCache && this.internalsCache.key === key && now - this.internalsCache.at < 5000) {
+      return this.internalsCache.snap
+    }
+    const snap = discoverClaudeInternals({ cwds, now })
+    this.internalsCache = { key, at: now, snap }
+    return snap
   }
   /** Item + full file content + nested items, for the internal detail tab. The
    *  path always comes from a fresh discovery snapshot (never the renderer),
@@ -477,6 +500,7 @@ export class Core {
     try {
       if (!lstatSync(item.path).isFile()) return false
       writeFileSync(item.path, content, 'utf8')
+      this.internalsCache = null // an edited skill/plugin must re-list fresh
       return true
     } catch {
       return false
@@ -554,13 +578,51 @@ export class Core {
     this.send('memory:changed', null)
   }
 
+  // --- chat prompt navigator (sidebar "Prompts" section) ---
+  /** Parsed prompts per transcript, invalidated by size/mtime — the sidebar
+   *  refreshes after every PTY burst, and most transcripts haven't changed. */
+  private readonly promptsCache = new Map<string, { size: number; mtimeMs: number; prompts: UserPrompt[] }>()
+
+  /** Every user prompt in each of the Space's chats, grouped per tab. Same
+   *  session resolution as saveConversation: live PTY binding for claude tabs,
+   *  else the last recorded session (covers exited claudes and shell tabs
+   *  where a hand-started claude was bound by the watcher). */
+  listPrompts(spaceId: string): TabPrompts[] {
+    const out: TabPrompts[] = []
+    for (const t of this.repo.listTabs(spaceId)) {
+      if (t.kind !== 'claude' && t.kind !== 'shell') continue
+      const live = t.kind === 'claude' ? this.pty.get(t.id) : undefined
+      const path = live?.transcriptPath ?? this.repo.latestSessionForTab(t.id)?.transcriptPath
+      if (!path) continue
+      const prompts = this.promptsFor(path)
+      if (prompts.length) out.push({ tabId: t.id, tabTitle: t.title, prompts })
+    }
+    return out
+  }
+
+  private promptsFor(path: string): UserPrompt[] {
+    let st: { size: number; mtimeMs: number }
+    try {
+      st = statSync(path)
+    } catch {
+      return [] // no transcript yet (fresh session) or pruned
+    }
+    const hit = this.promptsCache.get(path)
+    if (hit && hit.size === st.size && hit.mtimeMs === st.mtimeMs) return hit.prompts
+    const prompts = userPrompts(readFileSync(path, 'utf8'))
+    this.promptsCache.set(path, { size: st.size, mtimeMs: st.mtimeMs, prompts })
+    return prompts
+  }
+
   // --- saved conversations (local JSON snapshots of a tab's transcript) ---
   saveConversation(tabId: string, title?: string): SavedConversation {
     const tab = this.repo.getTab(tabId)
     if (!tab) throw new Error('Tab not found')
     // Prefer the live PTY binding; fall back to the last recorded session so a
-    // tab whose claude has exited can still be saved from its transcript.
-    const live = this.pty.get(tabId)
+    // tab whose claude has exited can still be saved from its transcript. A
+    // shell tab's PTY binding is a placeholder (no claude was auto-run there),
+    // so only watcher-discovered sessions count for it.
+    const live = tab.kind === 'claude' ? this.pty.get(tabId) : undefined
     const past = this.repo.latestSessionForTab(tabId)
     const sessionId = live?.sessionId ?? past?.ccSessionId
     const transcriptPath = live?.transcriptPath ?? past?.transcriptPath

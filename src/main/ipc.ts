@@ -81,6 +81,9 @@ export function registerIpc(core: Core): void {
   )
   ipcMain.handle('conversation:delete', (_e, id: string) => core.deleteConversation(id))
 
+  // --- chat prompt navigator ---
+  ipcMain.handle('prompts:list', (_e, spaceId: string) => core.listPrompts(spaceId))
+
   // --- Claude internals ---
   ipcMain.handle('internals:list', (_e, spaceId: string) => core.listInternals(spaceId))
   ipcMain.handle('internals:detail', (_e, p: { spaceId: string; id: string }) => core.internalDetail(p.spaceId, p.id))

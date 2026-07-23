@@ -827,6 +827,7 @@ button {
 .memory-search {
   display: block;
   box-sizing: border-box;
+  width: calc(100% - 20px);
   margin: 0 10px 8px;
   background: var(--input-bg);
   border: 1px solid var(--line);
@@ -957,6 +958,29 @@ button {
   align-items: center;
   gap: 1px;
   flex: 0 0 auto;
+}
+
+/* prompt navigator rows (Prompts section — click jumps to the chat) */
+.prompt-mark {
+  flex: 0 0 auto;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 700;
+  line-height: 1;
+}
+.prompt-row:hover .prompt-mark {
+  color: var(--accent);
+}
+.prompt-group {
+  margin: 6px 13px 1px;
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 .mem-row:hover .ctx-scope {
   display: none;

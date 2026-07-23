@@ -82,6 +82,9 @@ const api: ZedeApi = {
     load: (id, opts) => ipcRenderer.invoke('conversation:load', { id, ...opts }),
     delete: (id) => ipcRenderer.invoke('conversation:delete', id)
   },
+  prompts: {
+    list: (spaceId) => ipcRenderer.invoke('prompts:list', spaceId)
+  },
   internals: {
     list: (spaceId) => ipcRenderer.invoke('internals:list', spaceId),
     detail: (spaceId, id) => ipcRenderer.invoke('internals:detail', { spaceId, id }),
