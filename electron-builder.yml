@@ -1,0 +1,40 @@
+appId: com.zede.app
+productName: Zede
+directories:
+  buildResources: build
+files:
+  - out/**
+  - package.json
+  # Keep the PNG master available to the running app as well as to the packager.
+  - build/icon.png
+# Native .node addons (better-sqlite3, node-pty) must be unpacked from the asar
+# so they can be dlopen'd at runtime.
+asarUnpack:
+  - "**/*.node"
+mac:
+  icon: build/icon.icns
+  category: public.app-category.developer-tools
+  target:
+    - target: dmg
+      arch: [arm64, x64]
+    - target: zip
+      arch: [arm64, x64]
+  # Hardened runtime + entitlements are required for notarization. Signing and
+  # notarization need an Apple Developer ID cert + credentials in the environment
+  # (CSC_LINK / CSC_KEY_PASSWORD / APPLE_ID / APPLE_APP_SPECIFIC_PASSWORD /
+  # APPLE_TEAM_ID). See docs/packaging.md. Left enabled so a credentialed build
+  # signs correctly; an unsigned local `dist` still produces a runnable .app.
+  hardenedRuntime: true
+  gatekeeperAssess: false
+  entitlements: build/entitlements.mac.plist
+  entitlementsInherit: build/entitlements.mac.plist
+# Notarize only when credentials are present (electron-builder skips otherwise).
+afterSign: build/notarize.cjs
+win:
+  icon: build/icon.ico
+  target:
+    - nsis
+linux:
+  icon: build/icon.png
+  target:
+    - AppImage

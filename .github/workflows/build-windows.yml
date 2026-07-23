@@ -1,0 +1,47 @@
+name: Build Windows
+
+# Native addons (better-sqlite3, node-pty) can't be cross-compiled from macOS,
+# so the Windows installer must be built on a real Windows runner. Runs on demand
+# and for tagged releases; uploads the NSIS installer as a build artifact.
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      # Rebuild native modules against Electron's ABI for win32 (windows-latest
+      # ships MSVC build tools + Python, so node-gyp compiles without extra setup).
+      - name: Rebuild native modules
+        run: pnpm run rebuild
+
+      # electron-vite build → electron-builder; on Windows this produces the NSIS
+      # installer declared under `win:` in electron-builder.yml.
+      - name: Package Windows installer
+        run: pnpm run dist
+
+      - name: Upload installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: zede-windows-installer
+          path: |
+            dist/*.exe
+            dist/*.exe.blockmap
+          if-no-files-found: error

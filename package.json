@@ -1,0 +1,47 @@
+{
+  "name": "zede",
+  "version": "0.0.1",
+  "description": "Arc-like terminal shell for orchestrating Claude Code sessions with local, deletable memory",
+  "main": "./out/main/index.js",
+  "license": "MIT",
+  "repository": "github:goldinitp/zede",
+  "homepage": "https://zede.dev",
+  "scripts": {
+    "dev": "electron-vite dev",
+    "build": "electron-vite build",
+    "preview": "electron-vite preview",
+    "typecheck:node": "tsc --noEmit -p tsconfig.node.json",
+    "typecheck:web": "tsc --noEmit -p tsconfig.web.json",
+    "typecheck": "npm run typecheck:node && npm run typecheck:web",
+    "rebuild": "electron-rebuild -f -w better-sqlite3,node-pty",
+    "smoke:native": "electron scripts/smoke-native.cjs",
+    "spike:extract": "node scripts/spike-extract.mjs",
+    "spike:capture": "node scripts/spike-capture.mjs",
+    "selftest": "electron-vite build && ZEDE_SELFTEST=1 electron .",
+    "dist": "electron-vite build && electron-builder",
+    "dist:dir": "electron-vite build && electron-builder --dir"
+  },
+  "dependencies": {
+    "@xterm/addon-fit": "^0.11.0",
+    "@xterm/addon-webgl": "^0.19.0",
+    "@xterm/xterm": "^6.0.0",
+    "better-sqlite3": "^12.11.1",
+    "chokidar": "^5.0.0",
+    "node-pty": "^1.1.0",
+    "react": "^19.2.7",
+    "react-dom": "^19.2.7"
+  },
+  "devDependencies": {
+    "@electron/rebuild": "^4.0.4",
+    "@types/better-sqlite3": "^7.6.13",
+    "@types/node": "^26.0.0",
+    "@types/react": "^19.2.17",
+    "@types/react-dom": "^19.2.3",
+    "@vitejs/plugin-react": "^5.2.0",
+    "electron": "^42.5.0",
+    "electron-builder": "^26.15.3",
+    "electron-vite": "^5.0.0",
+    "typescript": "^6.0.3",
+    "vite": "^7.3.5"
+  }
+}
