@@ -1,0 +1,333 @@
+WEBVTT
+
+1
+00:00:00.000 --> 00:00:02.506
+Hey everyone, I was,
+
+2
+00:00:02.517 --> 00:00:04.990
+working on Claude Code quite a bit,
+
+3
+00:00:05.001 --> 00:00:07.336
+these days and I found a couple of,
+
+4
+00:00:07.347 --> 00:00:10.892
+I will say gaps, or not gaps,
+
+5
+00:00:10.893 --> 00:00:14.128
+basically the way of, I work, I felt like I could have added,
+
+6
+00:00:14.138 --> 00:00:18.508
+those things into a terminal that would have helped my day-to-day life.
+
+7
+00:00:19.909 --> 00:00:23.819
+So, I just tried to create, an, a terminal application called Zede,
+
+8
+00:00:23.829 --> 00:00:27.263
+what it basically does is, it's kind of a Arc-styled,
+
+9
+00:00:27.274 --> 00:00:29.748
+terminal, where you can, pin any,
+
+10
+00:00:29.759 --> 00:00:32.525
+you can pin any tab, any terminal,
+
+11
+00:00:32.526 --> 00:00:34.722
+next time when you close and when you open,
+
+12
+00:00:34.723 --> 00:00:37.638
+it, it keeps of that particular,
+
+13
+00:00:37.649 --> 00:00:40.805
+pinned tab. Then also,
+
+14
+00:00:40.816 --> 00:00:43.903
+so this, this is the interface of it, where you can either open,
+
+15
+00:00:43.904 --> 00:00:46.360
+so from this new Claude, new tab,
+
+16
+00:00:46.361 --> 00:00:48.727
+you can actually open a Claude Code or,
+
+17
+00:00:48.738 --> 00:00:53.152
+a shell. You can also load any of the previously saved,
+
+18
+00:00:53.163 --> 00:00:55.178
+interfaces, which it can, it will,
+
+19
+00:00:55.179 --> 00:00:59.053
+It also gives you, like, you can compact the previous context and start a
+
+20
+00:00:59.054 --> 00:01:01.143
+new conversation with this. There are different spaces, like, you know, you can create
+
+21
+00:01:01.144 --> 00:01:05.654
+your personal space, office space,
+
+22
+00:01:05.655 --> 00:01:08.788
+and, it all gets saved. So there is a separation of,
+
+23
+00:01:08.789 --> 00:01:11.149
+thing. Apart from that,
+
+24
+00:01:11.150 --> 00:01:15.761
+this is our main, tab. Terminal window, I also have this Claude
+
+25
+00:01:15.762 --> 00:01:19.866
+context, thing, which basically exposes a lot of things that Claude has internally,
+
+26
+00:01:19.867 --> 00:01:22.233
+like, you know, skills, plugins, most of these,
+
+27
+00:01:22.234 --> 00:01:25.549
+we hardly even know, like, we have a conversation in Claude,
+
+28
+00:01:25.550 --> 00:01:27.868
+Claude tries to basically,
+
+29
+00:01:27.869 --> 00:01:29.931
+you know, say part of,
+
+30
+00:01:29.942 --> 00:01:32.458
+those conversations into maybe facts,
+
+31
+00:01:32.459 --> 00:01:34.833
+decisions, preferences, to-dos,
+
+32
+00:01:35.243 --> 00:01:37.296
+and next time when we are, typing something,
+
+33
+00:01:37.397 --> 00:01:42.192
+our, output is basically, the output is basically impacted by all
+
+34
+00:01:42.193 --> 00:01:44.714
+these things that Claude already stores, like,
+
+35
+00:01:44.715 --> 00:01:46.862
+there are 1,273 facts,
+
+36
+00:01:46.872 --> 00:01:49.351
+it has stored, right, and, we have hardly any idea,
+
+37
+00:01:49.352 --> 00:01:51.382
+like, you know what these are like, there are different.
+
+38
+00:01:51.383 --> 00:01:55.113
+These many to-dos, all these are basically internally what Claude has stored,
+
+39
+00:01:55.124 --> 00:01:57.155
+I, another thing that I feel problematic with me is, these prompts, so, when,
+
+40
+00:01:57.156 --> 00:01:57.357
+when, when
+
+41
+00:02:08.227 --> 00:02:13.473
+I want to navigate back to the previous conversation and.
+
+42
+00:02:13.474 --> 00:02:16.490
+It's very difficult, like, you know, between those,
+
+43
+00:02:16.500 --> 00:02:19.032
+long chat, it's very hard to find your own chat,
+
+44
+00:02:19.364 --> 00:02:21.058
+so this prompt basically, can give you option where you can click on any
+
+45
+00:02:21.805 --> 00:02:23.883
+prompt and it can scroll you back to the previous prompt, it's a demo
+
+46
+00:02:23.884 --> 00:02:26.314
+time now, I will give you a quick demo of things.
+
+47
+00:02:32.691 --> 00:02:36.129
+Now, let's say, like, I have added a couple of prompts here.
+
+48
+00:02:36.139 --> 00:02:40.148
+so, what it will also do is, it, whatever our last prompt is,
+
+49
+00:02:40.149 --> 00:02:44.360
+it will just add that summary over here in this tab for easy recognition,
+
+50
+00:02:44.370 --> 00:02:46.631
+then, we can simply save this conversation,
+
+51
+00:02:46.641 --> 00:02:48.864
+let's say, like, Zede walkthrough,
+
+52
+00:02:48.865 --> 00:02:52.889
+Thanks for watching! So,
+
+53
+00:02:52.890 --> 00:02:56.233
+it, it saves, this entire conversation into JSON,
+
+54
+00:02:56.396 --> 00:02:59.273
+like, mostly Human Readable, it is already there in Claude Code,
+
+55
+00:02:59.274 --> 00:03:02.194
+but, it's not very easy to navigate those,
+
+56
+00:03:02.205 --> 00:03:04.996
+saved memories, but, with this, we can just save it to,
+
+57
+00:03:05.565 --> 00:03:08.015
+and next time, when we want, we can just,
+
+58
+00:03:08.026 --> 00:03:10.126
+load a conversation in a new session, and,
+
+59
+00:03:10.127 --> 00:03:13.591
+it all starts from there. Apart from that,
+
+60
+00:03:13.602 --> 00:03:15.702
+discovering and editing skills, you can, let's say, like, I have a Humanizer skill,
+
+61
+00:03:15.712 --> 00:03:18.028
+which can basically, something, Claude Code, Open Code, and then, let's say,
+
+62
+00:03:19.028 --> 00:03:21.752
+I want to edit this,
+
+63
+00:03:22.461 --> 00:03:24.825
+I can simply go and, remove this,
+
+64
+00:03:24.826 --> 00:03:29.403
+okay. And I
+
+65
+00:03:29.404 --> 00:03:32.164
+can simply save it from here, so, it also makes,
+
+66
+00:03:32.175 --> 00:03:34.296
+the edit, managing of, skills, plugins, all this very easy, front,
+
+67
+00:03:34.307 --> 00:03:37.303
+easy to discover, and,
+
+68
+00:03:37.314 --> 00:03:42.124
+there are keyboard shortcuts like Command M,
+
+69
+00:03:43.124 --> 00:03:45.568
+this will close that side panel from right,
+
+70
+00:03:45.578 --> 00:03:47.906
+and, you can,
+
+71
+00:03:48.796 --> 00:03:50.800
+this, this panel can be closed, so, this gives you, distraction free space,
+
+72
+00:03:50.801 --> 00:03:55.049
+we also have settings where, you get to choose what thing you want,
+
+73
+00:03:55.059 --> 00:04:03.201
+and what, where the sync functionality
+
+74
+00:04:03.202 --> 00:04:06.648
+is not yet working,
+
+75
+00:04:08.036 --> 00:04:10.573
+I need to switch it and more time feeding on this,
+
+76
+00:04:10.583 --> 00:04:12.694
+yes, so, this is all it is,
+
+77
+00:04:12.705 --> 00:04:16.784
+I think, yep, you can also forget certain things like,
+
+78
+00:04:16.785 --> 00:04:19.924
+you know, you can just forget some to-dos and,
+
+79
+00:04:19.935 --> 00:04:22.014
+in case you recently forgotten something,
+
+80
+00:04:22.015 --> 00:04:24.888
+you, you can find it over here, that way you can also clean up
+
+81
+00:04:24.889 --> 00:04:28.224
+your, Claude coding memory and internals.
+
+82
+00:04:29.513 --> 00:04:32.421
+So, I think that's pretty much it,
+
+83
+00:04:32.431 --> 00:04:34.402
+hope this helps everyone. Thank you.

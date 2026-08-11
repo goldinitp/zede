@@ -1,0 +1,63 @@
+{
+  "name": "zede",
+  "version": "0.0.1",
+  "private": true,
+  "packageManager": "pnpm@10.33.0",
+  "engines": {
+    "node": ">=22 <25"
+  },
+  "description": "Arc-like terminal shell for orchestrating Claude Code sessions with local, deletable memory",
+  "main": "./out/main/index.js",
+  "license": "MIT",
+  "repository": "github:goldinitp/zede",
+  "homepage": "https://zede.dev",
+  "scripts": {
+    "dev": "electron-vite dev",
+    "build": "electron-vite build",
+    "preview": "electron-vite preview",
+    "typecheck:node": "tsc --noEmit -p tsconfig.node.json",
+    "typecheck:web": "tsc --noEmit -p tsconfig.web.json",
+    "typecheck": "pnpm run typecheck:node && pnpm run typecheck:web",
+    "lint": "eslint src test",
+    "test": "vitest run",
+    "check": "pnpm lint && pnpm typecheck && pnpm test && pnpm selftest",
+    "clean:dist": "node -e \"require('node:fs').rmSync('dist',{recursive:true,force:true})\"",
+    "build:app": "pnpm install && pnpm run rebuild && pnpm dist",
+    "rebuild": "electron-rebuild -f -w better-sqlite3,node-pty",
+    "smoke:native": "electron scripts/smoke-native.cjs",
+    "spike:extract": "node scripts/spike-extract.mjs",
+    "spike:capture": "node scripts/spike-capture.mjs",
+    "selftest": "electron-vite build && ZEDE_SELFTEST=1 electron .",
+    "dist": "pnpm clean:dist && electron-vite build && electron-builder -c.mac.identity=null",
+    "dist:dir": "pnpm clean:dist && electron-vite build && electron-builder --dir -c.mac.identity=null",
+    "dist:release": "pnpm clean:dist && electron-vite build && electron-builder --mac dmg zip --arm64 --x64"
+  },
+  "dependencies": {
+    "@xterm/addon-fit": "^0.11.0",
+    "@xterm/addon-webgl": "^0.19.0",
+    "@xterm/xterm": "^6.0.0",
+    "better-sqlite3": "^12.11.1",
+    "node-pty": "^1.1.0",
+    "react": "^19.2.8",
+    "react-dom": "^19.2.8"
+  },
+  "devDependencies": {
+    "@electron/notarize": "^3.1.1",
+    "@electron/rebuild": "^4.2.0",
+    "@eslint/js": "^10.0.1",
+    "@types/better-sqlite3": "^7.6.13",
+    "@types/node": "^24.13.3",
+    "@types/react": "^19.2.18",
+    "@types/react-dom": "^19.2.4",
+    "@vitejs/plugin-react": "^5.2.0",
+    "electron": "^42.9.0",
+    "electron-builder": "^26.15.3",
+    "electron-vite": "^5.0.0",
+    "eslint": "^10.8.1",
+    "eslint-plugin-react-hooks": "^7.1.1",
+    "typescript": "^6.0.3",
+    "typescript-eslint": "^8.67.0",
+    "vite": "^7.3.6",
+    "vitest": "^4.1.10"
+  }
+}

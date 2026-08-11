@@ -1,0 +1,25 @@
+node_modules/
+out/
+dist/
+.vite/
+
+# Zede-managed injected context (spec §6.5, §9) — never commit
+.zede/
+.loom/
+
+# env files — never commit
+.env*
+
+# OS / editor
+.DS_Store
+*.log
+.idea/
+.vscode/*
+!.vscode/extensions.json
+
+# local scratch
+scratch/
+*.local
+
+# internal design artifacts — not part of the public repo
+design_handoff_terminal_redesign/
