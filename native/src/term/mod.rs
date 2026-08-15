@@ -388,9 +388,21 @@ impl TermSession {
         *self.term.lock().mode()
     }
 
+    // `MasterPty::process_group_leader` exists only on Unix; ConPTY has no
+    // process-group notion, so Windows reports no foreground process.
+    #[cfg(unix)]
+    fn leader_pid(&self) -> Option<i32> {
+        self.master.process_group_leader().map(|pid| pid as i32)
+    }
+
+    #[cfg(windows)]
+    fn leader_pid(&self) -> Option<i32> {
+        None
+    }
+
     /// Foreground process-group leader pid (uncached; one cheap syscall).
     pub fn foreground_pid(&self) -> Option<i32> {
-        self.master.process_group_leader().map(|pid| pid as i32)
+        self.leader_pid()
     }
 
     /// Foreground process name of the PTY (cached ~500ms). Drives the
@@ -401,10 +413,7 @@ impl TermSession {
                 return name.clone();
             }
         }
-        let name = self
-            .master
-            .process_group_leader()
-            .and_then(|pid| pty::process_name(pid as i32));
+        let name = self.leader_pid().and_then(pty::process_name);
         self.proc_cache = Some((Instant::now(), name.clone()));
         name
     }
