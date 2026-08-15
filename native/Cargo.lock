@@ -3832,6 +3832,7 @@ dependencies = [
  "dirs",
  "eframe",
  "egui",
+ "image",
  "libc",
  "libproc",
  "portable-pty",
@@ -3839,6 +3840,7 @@ dependencies = [
  "rusqlite",
  "serde_json",
  "sha2",
+ "ttf-parser",
  "uuid",
  "wgpu",
 ]

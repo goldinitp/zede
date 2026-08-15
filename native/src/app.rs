@@ -8,7 +8,7 @@ use std::sync::{Arc, RwLock};
 use std::time::Instant;
 
 use alacritty_terminal::vte::ansi::{CursorShape as AnsiCursorShape, CursorStyle as AnsiCursorStyle};
-use egui::{Align2, Color32, CornerRadius, Frame, Key, Modifiers, RichText, Vec2};
+use egui::{Align2, Frame, Key, Modifiers, RichText, Vec2};
 
 use crate::capture::{self, PromptFeed};
 use crate::db::{Db, MemoryRow, SpaceRow, TabRow};
@@ -21,9 +21,18 @@ use crate::term::{OscColors, TermSession};
 use crate::theme::{self, AppTheme};
 use crate::ui::memory::{self, MemoryAction};
 use crate::ui::sidebar::{self, Action, SidebarState, TabLive};
-use crate::ui::{settings_panel, terminal};
+use crate::ui::{settings_panel, style, terminal};
+
+/// `--screenshot` plumbing: render a few frames, grab the composited frame,
+/// save it, quit. Lets design changes be verified headlessly.
+struct Shot {
+    path: PathBuf,
+    frames: u32,
+    requested: bool,
+}
 
 pub struct ZedeApp {
+    shot: Option<Shot>,
     db: Db,
     settings: Settings,
     theme: &'static AppTheme,
@@ -145,78 +154,15 @@ pub fn osc_from_theme(t: &AppTheme) -> OscColors {
     }
 }
 
-fn apply_visuals(ctx: &egui::Context, t: &AppTheme) {
-    let mut v = egui::Visuals::dark();
-    v.panel_fill = t.chrome.chrome;
-    v.window_fill = t.chrome.chrome;
-    v.window_stroke = egui::Stroke::new(1.0_f32, t.chrome.titlebar_1);
-    v.override_text_color = Some(t.chrome.text_2);
-    v.selection.bg_fill =
-        Color32::from_rgba_unmultiplied(t.chrome.accent.r(), t.chrome.accent.g(), t.chrome.accent.b(), 70);
-    ctx.set_visuals(v);
-}
-
-/// Load an installed Nerd Font so powerline prompts render; egui's bundled
-/// Hack covers everything else.
-fn find_nerd_font() -> Option<Vec<u8>> {
-    let mut dirs_to_scan: Vec<PathBuf> = Vec::new();
-    if let Some(home) = dirs::home_dir() {
-        dirs_to_scan.push(home.join("Library/Fonts"));
-        dirs_to_scan.push(home.join(".local/share/fonts"));
-    }
-    dirs_to_scan.push(PathBuf::from("/Library/Fonts"));
-    dirs_to_scan.push(PathBuf::from("/usr/share/fonts"));
-
-    let mut best: Option<(u8, PathBuf)> = None;
-    for dir in dirs_to_scan {
-        let Ok(entries) = std::fs::read_dir(&dir) else { continue };
-        for entry in entries.flatten() {
-            let name = entry.file_name().to_string_lossy().to_lowercase();
-            let is_font = name.ends_with(".ttf") || name.ends_with(".otf");
-            let is_nerd = name.contains("nerd") || name.contains(" nf ") || name.contains(" nf.");
-            if !is_font || !is_nerd || !name.contains("regular") {
-                continue;
-            }
-            let rank = if name.contains("meslo") {
-                0
-            } else if name.contains("jetbrains") {
-                1
-            } else if name.contains("fira") {
-                2
-            } else if name.contains("hack") {
-                3
-            } else {
-                9
-            };
-            if best.as_ref().map_or(true, |(r, _)| rank < *r) {
-                best = Some((rank, entry.path()));
-            }
-        }
-    }
-    best.and_then(|(_, path)| std::fs::read(path).ok())
-}
-
-fn install_fonts(ctx: &egui::Context) {
-    let mut defs = egui::FontDefinitions::default();
-    if let Some(bytes) = find_nerd_font() {
-        defs.font_data
-            .insert("nerd".to_string(), Arc::new(egui::FontData::from_owned(bytes)));
-        if let Some(family) = defs.families.get_mut(&egui::FontFamily::Monospace) {
-            family.insert(0, "nerd".to_string());
-        }
-    }
-    ctx.set_fonts(defs);
-}
-
 impl ZedeApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Result<ZedeApp, String> {
-        install_fonts(&cc.egui_ctx);
+        style::install_fonts(&cc.egui_ctx);
 
         let db = Db::open(&db_path())?;
         db.ensure_seed();
         let settings = Settings::load(&db);
         let th = theme::theme_by_id(&settings.theme);
-        apply_visuals(&cc.egui_ctx, th);
+        style::apply(&cc.egui_ctx, th);
 
         let spaces = db.list_spaces();
         let active_space = db
@@ -228,7 +174,14 @@ impl ZedeApp {
 
         let (learn_tx, learn_rx) = extract::start_worker(Some(cc.egui_ctx.clone()));
         let (sync_tx, sync_rx) = start_sync_worker(cc.egui_ctx.clone());
+        let shot = std::env::var("ZEDE_SHOT_PATH").ok().map(|p| Shot {
+            path: PathBuf::from(p),
+            frames: 0,
+            requested: false,
+        });
+        let shot_ui = std::env::var("ZEDE_SHOT_UI").unwrap_or_default();
         let mut app = ZedeApp {
+            shot,
             db,
             settings,
             theme: th,
@@ -271,6 +224,13 @@ impl ZedeApp {
             .db
             .meta_get(sync::META_AUTH_MODE)
             .unwrap_or_else(|| "git".to_string());
+        if shot_ui.contains("memory") {
+            app.show_memory = true;
+            app.reload_memories();
+        }
+        if shot_ui.contains("settings") {
+            app.show_settings = true;
+        }
         app.load_tabs();
         Ok(app)
     }
@@ -615,47 +575,30 @@ impl ZedeApp {
         }
     }
 
-    fn dead_overlay(
+    /// Dead-session restart affordance (`.term-exited`): a quiet accent pill
+    /// in the terminal's bottom-left corner, not a modal.
+    fn dead_bar(
         &self,
         ctx: &egui::Context,
         rect: egui::Rect,
         tab_id: &str,
         exit_code: i32,
     ) -> Option<DeadChoice> {
-        let painter = ctx.layer_painter(egui::LayerId::new(
-            egui::Order::Middle,
-            egui::Id::new(("dead-dim", tab_id)),
-        ));
-        painter.rect_filled(rect, CornerRadius::ZERO, Color32::from_black_alpha(130));
-
         let mut choice = None;
-        egui::Area::new(egui::Id::new(("dead-overlay", tab_id)))
-            .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
+        egui::Area::new(egui::Id::new(("dead-bar", tab_id)))
+            .fixed_pos(rect.left_bottom() + Vec2::new(12.0, -44.0))
             .order(egui::Order::Foreground)
             .show(ctx, |ui| {
-                Frame::NONE
-                    .fill(self.theme.chrome.chrome)
-                    .corner_radius(CornerRadius::from(10.0))
-                    .inner_margin(18.0)
-                    .stroke(egui::Stroke::new(1.0_f32, self.theme.chrome.titlebar_1))
-                    .show(ui, |ui| {
-                        ui.vertical_centered(|ui| {
-                            ui.label(
-                                RichText::new(format!("Session ended (exit {exit_code})"))
-                                    .color(self.theme.chrome.text)
-                                    .size(13.5),
-                            );
-                            ui.add_space(10.0);
-                            ui.horizontal(|ui| {
-                                if ui.button("Restart session").clicked() {
-                                    choice = Some(DeadChoice::Restart);
-                                }
-                                if ui.button("Close tab").clicked() {
-                                    choice = Some(DeadChoice::Close);
-                                }
-                            });
-                        });
-                    });
+                ui.horizontal(|ui| {
+                    if style::pill_button(ui, "↻  Restart session", true, self.theme).clicked() {
+                        choice = Some(DeadChoice::Restart);
+                    }
+                    ui.label(
+                        RichText::new(format!("exited ({exit_code}) · ⌘W closes the tab"))
+                            .color(self.theme.chrome.muted)
+                            .size(12.0),
+                    );
+                });
             });
         choice
     }
@@ -663,11 +606,45 @@ impl ZedeApp {
 
 enum DeadChoice {
     Restart,
-    Close,
 }
 
 impl eframe::App for ZedeApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // --- `--screenshot` driver: settle a few frames, capture, save, quit.
+        if let Some(shot) = &mut self.shot {
+            shot.frames += 1;
+            if shot.frames >= 50 && !shot.requested {
+                shot.requested = true;
+                ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(egui::UserData::default()));
+            }
+            let image = ctx.input(|i| {
+                i.events.iter().find_map(|e| match e {
+                    egui::Event::Screenshot { image, .. } => Some(image.clone()),
+                    _ => None,
+                })
+            });
+            if let Some(image) = image {
+                let [w, h] = image.size;
+                let px: Vec<u8> = image
+                    .pixels
+                    .iter()
+                    .flat_map(|c| [c.r(), c.g(), c.b(), 255])
+                    .collect();
+                match image::RgbaImage::from_raw(w as u32, h as u32, px) {
+                    Some(buf) => {
+                        if let Err(e) = buf.save(&shot.path) {
+                            eprintln!("screenshot save failed: {e}");
+                        } else {
+                            println!("screenshot: {}", shot.path.display());
+                        }
+                    }
+                    None => eprintln!("screenshot: bad buffer size"),
+                }
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+            ctx.request_repaint();
+        }
+
         self.handle_shortcuts(ctx);
 
         // Sync results land here; the worker already persisted the summary to
@@ -683,7 +660,7 @@ impl eframe::App for ZedeApp {
                 if let Ok(mut osc) = self.osc.write() {
                     *osc = osc_from_theme(next_theme);
                 }
-                apply_visuals(ctx, next_theme);
+                style::apply(ctx, next_theme);
             }
             if self.show_memory {
                 self.reload_memories();
@@ -801,64 +778,98 @@ impl eframe::App for ZedeApp {
             }
         }
 
-        // --- header bar ------------------------------------------------------
-        egui::TopBottomPanel::top("header")
-            .exact_height(36.0)
-            .frame(Frame::NONE.fill(th.chrome.titlebar_2))
+        // --- titlebar (the real one — the native bar is hidden on macOS) ----
+        let traffic_inset: f32 = if cfg!(target_os = "macos") { 76.0 } else { 12.0 };
+        egui::TopBottomPanel::top("titlebar")
+            .exact_height(38.0)
+            .show_separator_line(false)
+            .frame(Frame::NONE)
             .show(ctx, |ui| {
-                ui.horizontal_centered(|ui| {
-                    ui.add_space(12.0);
-                    let space_name = self
-                        .spaces
-                        .iter()
-                        .find(|s| s.id == self.active_space)
-                        .map(|s| s.name.clone())
-                        .unwrap_or_default();
-                    ui.label(RichText::new(space_name).color(th.chrome.text_3).size(12.0));
-                    if let Some(tab) = self.current_tab() {
-                        ui.label(RichText::new("›").color(th.chrome.muted).size(12.0));
-                        let live_title = self
-                            .sessions
+                let rect = ui.max_rect();
+                style::gradient_rect(ui, rect, th.chrome.titlebar_1, th.chrome.titlebar_2);
+                ui.painter().hline(
+                    rect.x_range(),
+                    rect.bottom() - 0.5,
+                    egui::Stroke::new(1.0_f32, th.chrome.sep()),
+                );
+
+                // Drag anywhere that isn't a button; double-click zooms.
+                let drag = ui.interact(
+                    rect,
+                    ui.id().with("tb-drag"),
+                    egui::Sense::click_and_drag(),
+                );
+                if drag.drag_started() {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
+                }
+                if drag.double_clicked() {
+                    let maximized = ctx.input(|i| i.viewport().maximized.unwrap_or(false));
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(!maximized));
+                }
+
+                // Centered window title (absolute, like `.tb-title`).
+                let title = self
+                    .current_tab()
+                    .map(|tab| {
+                        self.sessions
                             .get(&tab.id)
                             .map(|s| s.title())
-                            .filter(|t| !t.is_empty());
-                        let title = live_title.unwrap_or(tab.title);
-                        ui.label(RichText::new(title).color(th.chrome.text).size(12.5));
-                    }
-                    if let Some((at, n)) = self.last_learned {
-                        if at.elapsed().as_secs() < 5 {
-                            ui.label(
-                                RichText::new(format!("✦ learned {n}"))
-                                    .color(th.chrome.green)
-                                    .size(11.0),
-                            );
-                        }
-                    }
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.add_space(10.0);
-                        if ui
-                            .button(RichText::new("⚙").size(14.0))
-                            .on_hover_text("Settings (⌘,)")
+                            .filter(|t| !t.is_empty())
+                            .unwrap_or(tab.title)
+                    })
+                    .unwrap_or_else(|| "Zede".to_string());
+                ui.painter().text(
+                    rect.center(),
+                    Align2::CENTER_CENTER,
+                    title,
+                    egui::FontId::proportional(13.0),
+                    th.chrome.text_2,
+                );
+
+                ui.allocate_ui_with_layout(
+                    rect.size(),
+                    egui::Layout::left_to_right(egui::Align::Center),
+                    |ui| {
+                        ui.add_space(traffic_inset);
+                        if style::sidebar_toggle_button(ui, self.sidebar_visible, th)
+                            .on_hover_text("Sidebar (⌘S)")
                             .clicked()
                         {
-                            self.show_settings = !self.show_settings;
+                            self.sidebar_visible = !self.sidebar_visible;
                         }
-                    });
-                });
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            ui.add_space(10.0);
+                            if style::icon_button(ui, "⚙", 14.0, self.show_settings, th)
+                                .on_hover_text("Settings (⌘,)")
+                                .clicked()
+                            {
+                                self.show_settings = !self.show_settings;
+                            }
+                            if style::icon_button(ui, "✦", 13.0, self.show_memory, th)
+                                .on_hover_text("Claude Context (⌘M)")
+                                .clicked()
+                            {
+                                self.show_memory = !self.show_memory;
+                                if self.show_memory {
+                                    self.reload_memories();
+                                }
+                            }
+                            if let Some((at, n)) = self.last_learned {
+                                if at.elapsed().as_secs() < 5 {
+                                    ui.label(
+                                        RichText::new(format!("✦ learned {n}"))
+                                            .color(th.chrome.green)
+                                            .size(11.0),
+                                    );
+                                }
+                            }
+                        });
+                    },
+                );
             });
 
-        // --- spaces rail + tab sidebar --------------------------------------
+        // --- sidebar: Space header, tabs, prompts, Space chips ---------------
         if self.sidebar_visible {
-            egui::SidePanel::left("rail")
-                .exact_width(52.0)
-                .resizable(false)
-                .frame(Frame::NONE.fill(th.chrome.editor_header))
-                .show(ctx, |ui| {
-                    if let Some(a) = sidebar::spaces_rail(ui, &self.spaces, &self.active_space, th) {
-                        pending.push(a);
-                    }
-                });
-
             let space = self
                 .spaces
                 .iter()
@@ -886,14 +897,17 @@ impl eframe::App for ZedeApp {
                     .map(|f| f.prompts.as_slice());
                 let sidebar_state = &mut self.sidebar_state;
                 let tabs = &self.tabs;
+                let spaces = &self.spaces;
                 egui::SidePanel::left("tabs")
-                    .default_width(212.0)
-                    .width_range(170.0..=320.0)
+                    .default_width(224.0)
+                    .width_range(190.0..=320.0)
+                    .show_separator_line(false)
                     .frame(Frame::NONE.fill(th.chrome.chrome))
                     .show(ctx, |ui| {
                         if let Some(a) = sidebar::tab_panel(
                             ui,
                             &space,
+                            spaces,
                             tabs,
                             active_tab.as_deref(),
                             &live,
@@ -920,6 +934,7 @@ impl eframe::App for ZedeApp {
             egui::SidePanel::right("memory")
                 .default_width(280.0)
                 .width_range(220.0..=420.0)
+                .show_separator_line(false)
                 .frame(Frame::NONE.fill(th.chrome.chrome))
                 .show(ctx, |ui| {
                     mem_action = memory::memory_panel(
@@ -941,12 +956,29 @@ impl eframe::App for ZedeApp {
             .frame(Frame::NONE.fill(th.term.background))
             .show(ctx, |ui| {
                 let Some(tab) = self.current_tab() else {
-                    ui.centered_and_justified(|ui| {
+                    // `.panes-empty`: quiet actions, optically centered.
+                    ui.add_space((ui.available_height() * 0.4).max(0.0));
+                    ui.vertical_centered(|ui| {
                         ui.label(
-                            RichText::new("⌘T — new Claude tab")
+                            RichText::new("No tabs in this Space yet")
                                 .color(th.chrome.muted)
-                                .size(14.0),
+                                .size(13.0),
                         );
+                        ui.add_space(14.0);
+                        ui.horizontal(|ui| {
+                            let w = 330.0_f32;
+                            ui.add_space((ui.available_width() - w).max(0.0) / 2.0);
+                            if style::pill_button(ui, "✳  New Claude tab    ⌘T", true, th)
+                                .clicked()
+                            {
+                                pending.push(Action::NewTab(TabKind::Claude));
+                            }
+                            if style::pill_button(ui, "❯  New shell    ⇧⌘T", false, th)
+                                .clicked()
+                            {
+                                pending.push(Action::NewTab(TabKind::Shell));
+                            }
+                        });
                     });
                     return;
                 };
@@ -958,10 +990,11 @@ impl eframe::App for ZedeApp {
                         ui.vertical_centered(|ui| {
                             ui.label(
                                 RichText::new(format!("Failed to start terminal: {err}"))
-                                    .color(th.chrome.red),
+                                    .color(th.chrome.red)
+                                    .size(13.0),
                             );
-                            ui.add_space(8.0);
-                            if ui.button("Retry").clicked() {
+                            ui.add_space(10.0);
+                            if style::pill_button(ui, "↻  Retry", true, th).clicked() {
                                 self.spawn_errors.remove(&tab.id);
                             }
                         });
@@ -978,14 +1011,12 @@ impl eframe::App for ZedeApp {
                 };
 
                 if dead {
-                    match self.dead_overlay(ctx, resp_rect, &tab.id, exit_code) {
-                        Some(DeadChoice::Restart) => {
-                            self.sessions.remove(&tab.id);
-                            self.no_resume_once.insert(tab.id.clone());
-                            self.focus_terminal = true;
-                        }
-                        Some(DeadChoice::Close) => pending.push(Action::CloseTab(tab.id.clone())),
-                        None => {}
+                    if let Some(DeadChoice::Restart) =
+                        self.dead_bar(ctx, resp_rect, &tab.id, exit_code)
+                    {
+                        self.sessions.remove(&tab.id);
+                        self.no_resume_once.insert(tab.id.clone());
+                        self.focus_terminal = true;
                     }
                 }
             });
@@ -1030,7 +1061,7 @@ impl eframe::App for ZedeApp {
                     if let Ok(mut osc) = self.osc.write() {
                         *osc = osc_from_theme(self.theme);
                     }
-                    apply_visuals(ctx, self.theme);
+                    style::apply(ctx, self.theme);
                 }
             }
         }

@@ -23,6 +23,12 @@ sha2 = "0.10"
 serde_json = "1"
 uuid = { version = "1", features = ["v4"] }
 dirs = "6"
+# `--screenshot` saves the composited frame; png-only keeps the dep small.
+image = { version = "0.25", default-features = false, features = ["png"] }
+# Validates system UI fonts (SF Pro / Helvetica Neue) before handing them to
+# egui — a bad face would otherwise panic at first layout. Same version egui
+# already vendors via ab_glyph.
+ttf-parser = "0.25"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

@@ -23,6 +23,7 @@ pub struct TermPalette {
 
 #[derive(Clone)]
 pub struct Chrome {
+    #[allow(dead_code)] // `--editor-header` — reserved for the editor pane
     pub editor_header: Color32,
     pub chrome: Color32,
     pub titlebar_1: Color32,
@@ -37,6 +38,73 @@ pub struct Chrome {
     #[allow(dead_code)] // status badges (P5)
     pub amber: Color32,
     pub red: Color32,
+}
+
+/// Alpha-derived tokens from app.css (`color-mix` / rgba values there). These
+/// are computed, not stored, so themes stay a 1:1 port of shared/themes.ts.
+impl Chrome {
+    /// rgba(255,255,255,.06) — resting control fill + in-panel hairlines.
+    pub fn fill(&self) -> Color32 {
+        Color32::from_rgba_unmultiplied(255, 255, 255, 15)
+    }
+    /// rgba(255,255,255,.07) — row hover.
+    pub fn fill_h(&self) -> Color32 {
+        Color32::from_rgba_unmultiplied(255, 255, 255, 18)
+    }
+    /// rgba(255,255,255,.10) — pressed / active control fill.
+    pub fn fill_a(&self) -> Color32 {
+        Color32::from_rgba_unmultiplied(255, 255, 255, 26)
+    }
+    /// rgba(0,0,0,.28) — text inputs.
+    pub fn input_bg(&self) -> Color32 {
+        Color32::from_rgba_unmultiplied(0, 0, 0, 71)
+    }
+    /// rgba(255,255,255,.06) — hairline dividers inside a panel.
+    pub fn hairline(&self) -> Color32 {
+        Color32::from_rgba_unmultiplied(255, 255, 255, 15)
+    }
+    /// rgba(0,0,0,.45) — the 1px separators between panes.
+    pub fn sep(&self) -> Color32 {
+        Color32::from_rgba_unmultiplied(0, 0, 0, 115)
+    }
+    /// rgba(255,255,255,.10) — control borders.
+    pub fn line_2(&self) -> Color32 {
+        Color32::from_rgba_unmultiplied(255, 255, 255, 26)
+    }
+    /// accent @ 20% — selected row fill.
+    pub fn accent_soft(&self) -> Color32 {
+        with_alpha(self.accent, 51)
+    }
+    /// accent @ 35% — accent borders.
+    pub fn accent_line(&self) -> Color32 {
+        with_alpha(self.accent, 89)
+    }
+    /// accent @ 10% — quiet accent fills.
+    pub fn accent_fill(&self) -> Color32 {
+        with_alpha(self.accent, 26)
+    }
+    /// accent @ 18% — hovered accent fills / active Space chip.
+    pub fn accent_fill_h(&self) -> Color32 {
+        with_alpha(self.accent, 46)
+    }
+    /// accent mixed 32% toward white — accent text on dark fills.
+    pub fn accent_bright(&self) -> Color32 {
+        mix(self.accent, Color32::WHITE, 0.32)
+    }
+    /// Fixed root token (app.css defines it outside the per-theme set).
+    pub fn magenta(&self) -> Color32 {
+        c(0xc678dd)
+    }
+}
+
+pub fn with_alpha(color: Color32, a: u8) -> Color32 {
+    Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), a)
+}
+
+/// Linear per-channel mix, the same thing CSS `color-mix(in srgb, …)` does.
+pub fn mix(a: Color32, b: Color32, t: f32) -> Color32 {
+    let ch = |x: u8, y: u8| -> u8 { (x as f32 + (y as f32 - x as f32) * t).round() as u8 };
+    Color32::from_rgb(ch(a.r(), b.r()), ch(a.g(), b.g()), ch(a.b(), b.b()))
 }
 
 #[derive(Clone)]

@@ -18,7 +18,9 @@ use crate::settings::Settings;
 use crate::term::{keys, TermSession};
 use crate::theme::{self, AppTheme};
 
-const PAD: f32 = 8.0;
+// `.terminal-host` padding: 10px 12px.
+const PAD_X: f32 = 12.0;
+const PAD_Y: f32 = 10.0;
 const RESIZE_DEBOUNCE_MS: u128 = 150;
 
 struct GlyphDraw {
@@ -52,7 +54,7 @@ pub fn terminal_view(
     let cell_h = (row_h * settings.line_height).max(1.0);
 
     let (rect, response) = ui.allocate_exact_size(ui.available_size(), Sense::click_and_drag());
-    let content = rect.shrink(PAD);
+    let content = rect.shrink2(Vec2::new(PAD_X, PAD_Y));
     let painter = ui.painter_at(rect);
     painter.rect_filled(rect, CornerRadius::ZERO, theme.term.background);
 
@@ -388,17 +390,21 @@ pub fn terminal_view(
         }
     }
 
-    // Scrolled-back indicator.
+    // Scrolled-back indicator, as a quiet pill.
     if display_offset > 0 {
         let text = format!("{display_offset} lines up");
-        let pill_pos = Pos2::new(rect.max.x - 12.0, rect.min.y + 12.0);
-        painter.text(
-            pill_pos,
-            Align2::RIGHT_TOP,
-            text,
-            FontId::proportional(11.0),
-            theme.chrome.text_3,
+        let font = FontId::proportional(11.0);
+        let galley = painter.layout_no_wrap(text, font, theme.chrome.text_2);
+        let pad = Vec2::new(8.0, 4.0);
+        let pill = Rect::from_min_size(
+            Pos2::new(
+                rect.max.x - 12.0 - galley.rect.width() - pad.x * 2.0,
+                rect.min.y + 10.0,
+            ),
+            galley.rect.size() + pad * 2.0,
         );
+        painter.rect_filled(pill, CornerRadius::from(20.0), Color32::from_black_alpha(140));
+        painter.galley(pill.min + pad, galley, theme.chrome.text_2);
     }
 
     response

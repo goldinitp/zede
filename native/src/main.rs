@@ -68,11 +68,31 @@ fn main() {
         }
     }
 
+    // `--screenshot out.png [--shot-ui memory,settings]`: render a few frames,
+    // save a composited capture, exit. Drives visual iteration + CI snapshots.
+    if let Some(pos) = args.iter().position(|a| a == "--screenshot") {
+        if let Some(path) = args.get(pos + 1) {
+            std::env::set_var("ZEDE_SHOT_PATH", path);
+        }
+        if let Some(ui_pos) = args.iter().position(|a| a == "--shot-ui") {
+            if let Some(list) = args.get(ui_pos + 1) {
+                std::env::set_var("ZEDE_SHOT_UI", list);
+            }
+        }
+    }
+
     let viewport = egui::ViewportBuilder::default()
         .with_title("Zede")
         .with_app_id("com.zede.native")
         .with_inner_size(egui::vec2(1280.0, 820.0))
         .with_min_inner_size(egui::vec2(640.0, 400.0));
+    // Full-width titlebar: the window keeps its traffic lights but drops the
+    // native bar; the app paints its own 38px titlebar (drag included).
+    #[cfg(target_os = "macos")]
+    let viewport = viewport
+        .with_fullsize_content_view(true)
+        .with_titlebar_shown(false)
+        .with_title_shown(false);
 
     let options = eframe::NativeOptions {
         viewport,

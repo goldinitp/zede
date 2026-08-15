@@ -1,10 +1,13 @@
-//! Settings window. Emits (key, value) pairs in the same string form the
-//! Electron app stored, so persistence and future sync stay compatible.
+//! Settings window (`.modal` in app.css): frameless rounded card, uppercase
+//! accent group labels, switch toggles. Emits (key, value) pairs in the same
+//! string form the Electron app stored, so persistence and sync stay
+//! compatible.
 
-use egui::{ComboBox, Context, RichText, Slider, TextEdit, Window};
+use egui::{Align2, ComboBox, Context, RichText, Slider, TextEdit, Window};
 
 use crate::settings::{CursorStyleKind, Settings};
 use crate::theme::{self, AppTheme};
+use crate::ui::style;
 
 pub struct SyncUi<'a> {
     pub configured: bool,
@@ -20,6 +23,29 @@ pub enum SyncAction {
     Disconnect,
 }
 
+fn group(ui: &mut egui::Ui, th: &AppTheme, text: &str) {
+    ui.add_space(14.0);
+    style::section_label(ui, text, th.chrome.accent);
+    ui.add_space(4.0);
+}
+
+fn row<R>(
+    ui: &mut egui::Ui,
+    th: &AppTheme,
+    label: &str,
+    control: impl FnOnce(&mut egui::Ui) -> R,
+) -> R {
+    let result = ui
+        .horizontal(|ui| {
+            ui.label(RichText::new(label).color(th.chrome.text_2).size(13.0));
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), control)
+                .inner
+        })
+        .inner;
+    ui.add_space(2.0);
+    result
+}
+
 pub fn settings_window(
     ctx: &Context,
     open: &mut bool,
@@ -29,6 +55,7 @@ pub fn settings_window(
 ) -> (Vec<(&'static str, String)>, Option<SyncAction>) {
     let mut changes: Vec<(&'static str, String)> = Vec::new();
     let mut sync_action: Option<SyncAction> = None;
+    let mut close = false;
 
     let mut theme_id = s.theme.clone();
     let mut font_size = s.font_size;
@@ -40,83 +67,98 @@ pub fn settings_window(
     let mut restore = s.restore_pinned_sessions;
     let mut tier = s.extraction_tier.clone();
 
-    Window::new("Settings")
-        .open(open)
+    Window::new("settings")
+        .title_bar(false)
         .collapsible(false)
         .resizable(false)
-        .default_width(360.0)
+        .movable(true)
+        .pivot(Align2::CENTER_CENTER)
+        .default_pos(ctx.screen_rect().center())
+        .fixed_size(egui::vec2(400.0, 0.0))
         .show(ctx, |ui| {
-            ui.label(RichText::new("Appearance").strong().color(th.chrome.text));
-            ui.add_space(6.0);
+            ui.spacing_mut().slider_width = 150.0;
 
-            ComboBox::from_label("Theme")
-                .selected_text(theme::theme_by_id(&theme_id).name)
-                .show_ui(ui, |ui| {
-                    for t in theme::themes() {
-                        ui.selectable_value(&mut theme_id, t.id.to_string(), t.name);
+            // --- header ----------------------------------------------------
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("Settings").size(15.0).strong().color(th.chrome.text));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if style::icon_button(ui, "×", 15.0, false, th).clicked() {
+                        close = true;
                     }
                 });
+            });
 
-            if ui
-                .add(Slider::new(&mut font_size, 9.0..=24.0).text("Font size"))
-                .changed()
-            {
-                changes.push(("fontSize", format!("{font_size}")));
-            }
-            if ui
-                .add(Slider::new(&mut line_height, 1.0..=2.0).text("Line spacing"))
-                .changed()
-            {
-                changes.push(("lineHeight", format!("{line_height}")));
-            }
-            if ui
-                .add(Slider::new(&mut letter_spacing, 0.0..=4.0).text("Letter spacing"))
-                .changed()
-            {
-                changes.push(("letterSpacing", format!("{letter_spacing}")));
-            }
-            if ui
-                .add(
-                    Slider::new(&mut scrollback, 500..=50_000)
-                        .logarithmic(true)
-                        .text("Scrollback (new sessions)"),
-                )
-                .changed()
-            {
-                changes.push(("scrollback", format!("{scrollback}")));
-            }
-
-            ComboBox::from_label("Cursor")
-                .selected_text(cursor_style.as_str())
-                .show_ui(ui, |ui| {
-                    ui.selectable_value(&mut cursor_style, CursorStyleKind::Block, "block");
-                    ui.selectable_value(&mut cursor_style, CursorStyleKind::Underline, "underline");
-                    ui.selectable_value(&mut cursor_style, CursorStyleKind::Bar, "bar");
-                });
-            if ui.checkbox(&mut cursor_blink, "Cursor blink").changed() {
-                changes.push(("cursorBlink", if cursor_blink { "1" } else { "0" }.into()));
-            }
+            group(ui, th, "Appearance");
+            row(ui, th, "Theme", |ui| {
+                ComboBox::from_id_salt("theme")
+                    .width(170.0)
+                    .selected_text(theme::theme_by_id(&theme_id).name)
+                    .show_ui(ui, |ui| {
+                        for t in theme::themes() {
+                            ui.selectable_value(&mut theme_id, t.id.to_string(), t.name);
+                        }
+                    });
+            });
+            row(ui, th, "Font size", |ui| {
+                if ui.add(Slider::new(&mut font_size, 9.0..=24.0)).changed() {
+                    changes.push(("fontSize", format!("{font_size}")));
+                }
+            });
+            row(ui, th, "Line spacing", |ui| {
+                if ui.add(Slider::new(&mut line_height, 1.0..=2.0)).changed() {
+                    changes.push(("lineHeight", format!("{line_height}")));
+                }
+            });
+            row(ui, th, "Letter spacing", |ui| {
+                if ui.add(Slider::new(&mut letter_spacing, 0.0..=4.0)).changed() {
+                    changes.push(("letterSpacing", format!("{letter_spacing}")));
+                }
+            });
+            row(ui, th, "Scrollback", |ui| {
+                if ui
+                    .add(Slider::new(&mut scrollback, 500..=50_000).logarithmic(true))
+                    .changed()
+                {
+                    changes.push(("scrollback", format!("{scrollback}")));
+                }
+            });
+            row(ui, th, "Cursor", |ui| {
+                ComboBox::from_id_salt("cursor")
+                    .width(170.0)
+                    .selected_text(cursor_style.as_str())
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut cursor_style, CursorStyleKind::Block, "block");
+                        ui.selectable_value(
+                            &mut cursor_style,
+                            CursorStyleKind::Underline,
+                            "underline",
+                        );
+                        ui.selectable_value(&mut cursor_style, CursorStyleKind::Bar, "bar");
+                    });
+            });
+            row(ui, th, "Cursor blink", |ui| {
+                if style::toggle(ui, &mut cursor_blink, th).changed() {
+                    changes.push(("cursorBlink", if cursor_blink { "1" } else { "0" }.into()));
+                }
+            });
 
             ui.add_space(10.0);
-            ui.separator();
-            ui.add_space(6.0);
-            ui.label(RichText::new("Memory & capture").strong().color(th.chrome.text));
-            ui.add_space(6.0);
-            if ui
-                .checkbox(
-                    &mut restore,
-                    "Pinned tabs resume their last Claude session on relaunch",
-                )
-                .changed()
-            {
-                changes.push(("restorePinnedSessions", if restore { "1" } else { "0" }.into()));
-            }
-            ComboBox::from_label("Extraction")
-                .selected_text(if tier == "claude" { "claude (higher recall)" } else { "heuristic (offline)" })
-                .show_ui(ui, |ui| {
-                    ui.selectable_value(&mut tier, "claude".to_string(), "claude (higher recall)");
-                    ui.selectable_value(&mut tier, "heuristic".to_string(), "heuristic (offline)");
-                });
+            style::hairline(ui, th);
+            group(ui, th, "Memory & capture");
+            row(ui, th, "Resume pinned tabs on relaunch", |ui| {
+                if style::toggle(ui, &mut restore, th).changed() {
+                    changes.push(("restorePinnedSessions", if restore { "1" } else { "0" }.into()));
+                }
+            });
+            row(ui, th, "Extraction", |ui| {
+                ComboBox::from_id_salt("tier")
+                    .width(170.0)
+                    .selected_text(if tier == "claude" { "claude" } else { "heuristic" })
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut tier, "claude".to_string(), "claude");
+                        ui.selectable_value(&mut tier, "heuristic".to_string(), "heuristic");
+                    });
+            });
             ui.label(
                 RichText::new("claude runs a fast model over new prompts; heuristic is free and offline.")
                     .size(10.5)
@@ -124,26 +166,21 @@ pub fn settings_window(
             );
 
             ui.add_space(10.0);
-            ui.separator();
-            ui.add_space(6.0);
-            ui.label(RichText::new("Sync").strong().color(th.chrome.text));
-            ui.add_space(6.0);
+            style::hairline(ui, th);
+            group(ui, th, "Sync");
             if sync.busy {
-                ui.label(RichText::new("Syncing…").color(th.chrome.amber).size(11.5));
+                ui.label(RichText::new("Syncing…").color(th.chrome.amber).size(12.0));
             } else if sync.configured {
-                ui.label(
-                    RichText::new(sync.url.as_str())
-                        .size(11.0)
-                        .color(th.chrome.text_3),
-                );
+                ui.label(RichText::new(sync.url.as_str()).size(11.5).color(th.chrome.text_3));
                 if let Some(last) = &sync.last_result {
                     ui.label(RichText::new(last).size(10.5).color(th.chrome.muted));
                 }
+                ui.add_space(4.0);
                 ui.horizontal(|ui| {
-                    if ui.button("Sync now").clicked() {
+                    if style::pill_button(ui, "Sync now", true, th).clicked() {
                         sync_action = Some(SyncAction::SyncNow);
                     }
-                    if ui.button("Disconnect").clicked() {
+                    if style::pill_button(ui, "Disconnect", false, th).clicked() {
                         sync_action = Some(SyncAction::Disconnect);
                     }
                 });
@@ -153,13 +190,25 @@ pub fn settings_window(
                         .hint_text("git@github.com:you/zede-sync.git")
                         .desired_width(f32::INFINITY),
                 );
-                ComboBox::from_label("Auth")
-                    .selected_text(if sync.mode.as_str() == "gh-cli" { "GitHub CLI (gh)" } else { "git (ssh keys / helpers)" })
-                    .show_ui(ui, |ui| {
-                        ui.selectable_value(sync.mode, "git".to_string(), "git (ssh keys / helpers)");
-                        ui.selectable_value(sync.mode, "gh-cli".to_string(), "GitHub CLI (gh)");
-                    });
-                if ui.button("Connect & sync").clicked() {
+                row(ui, th, "Auth", |ui| {
+                    ComboBox::from_id_salt("auth")
+                        .width(170.0)
+                        .selected_text(if sync.mode.as_str() == "gh-cli" {
+                            "GitHub CLI (gh)"
+                        } else {
+                            "git (ssh keys / helpers)"
+                        })
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(
+                                sync.mode,
+                                "git".to_string(),
+                                "git (ssh keys / helpers)",
+                            );
+                            ui.selectable_value(sync.mode, "gh-cli".to_string(), "GitHub CLI (gh)");
+                        });
+                });
+                ui.add_space(2.0);
+                if style::pill_button(ui, "Connect & sync", true, th).clicked() {
                     sync_action = Some(SyncAction::Connect);
                 }
                 ui.label(
@@ -169,13 +218,17 @@ pub fn settings_window(
                 );
             }
 
-            ui.add_space(10.0);
+            ui.add_space(12.0);
             ui.label(
                 RichText::new(format!("Zede native {}", env!("CARGO_PKG_VERSION")))
                     .size(10.5)
                     .color(th.chrome.muted),
             );
         });
+
+    if close || ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+        *open = false;
+    }
 
     if theme_id != s.theme {
         changes.push(("theme", theme_id));
