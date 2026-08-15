@@ -1,18 +1,34 @@
 //! Settings window. Emits (key, value) pairs in the same string form the
 //! Electron app stored, so persistence and future sync stay compatible.
 
-use egui::{ComboBox, Context, RichText, Slider, Window};
+use egui::{ComboBox, Context, RichText, Slider, TextEdit, Window};
 
 use crate::settings::{CursorStyleKind, Settings};
 use crate::theme::{self, AppTheme};
+
+pub struct SyncUi<'a> {
+    pub configured: bool,
+    pub busy: bool,
+    pub last_result: Option<String>,
+    pub url: &'a mut String,
+    pub mode: &'a mut String,
+}
+
+pub enum SyncAction {
+    Connect,
+    SyncNow,
+    Disconnect,
+}
 
 pub fn settings_window(
     ctx: &Context,
     open: &mut bool,
     s: &Settings,
     th: &AppTheme,
-) -> Vec<(&'static str, String)> {
+    sync: SyncUi<'_>,
+) -> (Vec<(&'static str, String)>, Option<SyncAction>) {
     let mut changes: Vec<(&'static str, String)> = Vec::new();
+    let mut sync_action: Option<SyncAction> = None;
 
     let mut theme_id = s.theme.clone();
     let mut font_size = s.font_size;
@@ -108,6 +124,52 @@ pub fn settings_window(
             );
 
             ui.add_space(10.0);
+            ui.separator();
+            ui.add_space(6.0);
+            ui.label(RichText::new("Sync").strong().color(th.chrome.text));
+            ui.add_space(6.0);
+            if sync.busy {
+                ui.label(RichText::new("Syncing…").color(th.chrome.amber).size(11.5));
+            } else if sync.configured {
+                ui.label(
+                    RichText::new(sync.url.as_str())
+                        .size(11.0)
+                        .color(th.chrome.text_3),
+                );
+                if let Some(last) = &sync.last_result {
+                    ui.label(RichText::new(last).size(10.5).color(th.chrome.muted));
+                }
+                ui.horizontal(|ui| {
+                    if ui.button("Sync now").clicked() {
+                        sync_action = Some(SyncAction::SyncNow);
+                    }
+                    if ui.button("Disconnect").clicked() {
+                        sync_action = Some(SyncAction::Disconnect);
+                    }
+                });
+            } else {
+                ui.add(
+                    TextEdit::singleline(sync.url)
+                        .hint_text("git@github.com:you/zede-sync.git")
+                        .desired_width(f32::INFINITY),
+                );
+                ComboBox::from_label("Auth")
+                    .selected_text(if sync.mode.as_str() == "gh-cli" { "GitHub CLI (gh)" } else { "git (ssh keys / helpers)" })
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(sync.mode, "git".to_string(), "git (ssh keys / helpers)");
+                        ui.selectable_value(sync.mode, "gh-cli".to_string(), "GitHub CLI (gh)");
+                    });
+                if ui.button("Connect & sync").clicked() {
+                    sync_action = Some(SyncAction::Connect);
+                }
+                ui.label(
+                    RichText::new("Any git remote works: GitHub, GitLab, a NAS over ssh, or a local bare repo.")
+                        .size(10.5)
+                        .color(th.chrome.muted),
+                );
+            }
+
+            ui.add_space(10.0);
             ui.label(
                 RichText::new(format!("Zede native {}", env!("CARGO_PKG_VERSION")))
                     .size(10.5)
@@ -124,5 +186,5 @@ pub fn settings_window(
     if tier != s.extraction_tier {
         changes.push(("extractionTier", tier));
     }
-    changes
+    (changes, sync_action)
 }

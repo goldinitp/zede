@@ -9,6 +9,7 @@ mod pty;
 mod redact;
 mod selftest;
 mod settings;
+mod sync;
 mod term;
 mod theme;
 mod ui;

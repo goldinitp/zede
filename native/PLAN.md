@@ -73,8 +73,15 @@ performance. This document is the working plan; `README.md` covers building.
   `CLAUDE.md` block on every claude tab spawn. ✅
   Remaining: the `claude -p` extractor tier (higher recall), the `notify`
   watcher for sessions Zede didn't spawn, FTS + semantic ranking terms.
-- **P7 — sync**: git-backed sync port (device-flow auth, merge rules,
-  tombstones, optional encryption).
+- **P7 — sync**: git-backed sync ported — deterministic wire format
+  (Electron-compatible; unmanaged categories like `links/` are preserved,
+  never clobbered), full merge rules (space/memory/settings LWW, symmetric
+  tie-breaks, tombstone union with the undo clock guard, never-resurrect),
+  the fetch→import→export→commit→push cycle with bounded rejected-push
+  retries, `git` + `gh-cli` auth modes, async worker + Settings UI.
+  Verified by an end-to-end two-database selftest over a local bare repo. ✅
+  Remaining: GitHub-App device flow (needs the registered client id),
+  encrypted repos (refused loudly for now), links/membership tables.
 - **P8 — packaging**: `scripts/bundle-mac.sh` builds an ad-hoc-signed
   `Zede.app` (bundle id `com.zede.native`, Electron's icon.icns, Info.plist)
   and optionally a DMG. ✅

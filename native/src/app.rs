@@ -16,6 +16,7 @@ use crate::extract;
 use crate::inject;
 use crate::pty::{self, TabKind};
 use crate::settings::{self, CursorStyleKind, Settings};
+use crate::sync;
 use crate::term::{OscColors, TermSession};
 use crate::theme::{self, AppTheme};
 use crate::ui::memory::{self, MemoryAction};
@@ -49,7 +50,54 @@ pub struct ZedeApp {
     last_learned: Option<(Instant, usize)>,
     learn_tx: std::sync::mpsc::Sender<extract::LearnRequest>,
     learn_rx: std::sync::mpsc::Receiver<extract::LearnResult>,
+    sync_tx: std::sync::mpsc::Sender<SyncCmd>,
+    sync_rx: std::sync::mpsc::Receiver<sync::SyncResult>,
+    sync_busy: bool,
+    sync_url_input: String,
+    sync_mode_input: String,
     focus_terminal: bool,
+}
+
+pub enum SyncCmd {
+    Setup { url: String, mode: String },
+    Now,
+}
+
+/// Sync runs on its own thread with its own db connection (WAL + busy
+/// timeout); the UI refreshes from the db when the result lands.
+fn start_sync_worker(
+    ctx: egui::Context,
+) -> (std::sync::mpsc::Sender<SyncCmd>, std::sync::mpsc::Receiver<sync::SyncResult>) {
+    let (cmd_tx, cmd_rx) = std::sync::mpsc::channel::<SyncCmd>();
+    let (res_tx, res_rx) = std::sync::mpsc::channel::<sync::SyncResult>();
+    std::thread::Builder::new()
+        .name("zede-sync".into())
+        .spawn(move || {
+            while let Ok(cmd) = cmd_rx.recv() {
+                let path = db_path();
+                let data_root = path
+                    .parent()
+                    .map(|p| p.to_path_buf())
+                    .unwrap_or_else(|| PathBuf::from("."));
+                let result = match Db::open(&path) {
+                    Ok(db) => match cmd {
+                        SyncCmd::Setup { url, mode } => sync::setup(&db, &data_root, &url, &mode),
+                        SyncCmd::Now => sync::sync_now(&db, &data_root),
+                    },
+                    Err(e) => sync::SyncResult {
+                        ok: false,
+                        error: Some(e),
+                        ..Default::default()
+                    },
+                };
+                if res_tx.send(result).is_err() {
+                    break;
+                }
+                ctx.request_repaint();
+            }
+        })
+        .ok();
+    (cmd_tx, res_rx)
 }
 
 pub fn electron_db_path() -> PathBuf {
@@ -172,6 +220,7 @@ impl ZedeApp {
             .ok_or("no spaces after seed")?;
 
         let (learn_tx, learn_rx) = extract::start_worker(Some(cc.egui_ctx.clone()));
+        let (sync_tx, sync_rx) = start_sync_worker(cc.egui_ctx.clone());
         let mut app = ZedeApp {
             db,
             settings,
@@ -197,8 +246,20 @@ impl ZedeApp {
             last_learned: None,
             learn_tx,
             learn_rx,
+            sync_tx,
+            sync_rx,
+            sync_busy: false,
+            sync_url_input: String::new(),
+            sync_mode_input: "git".to_string(),
             focus_terminal: true,
         };
+        if let Some(url) = app.db.meta_get(sync::META_REMOTE_URL) {
+            app.sync_url_input = url;
+        }
+        app.sync_mode_input = app
+            .db
+            .meta_get(sync::META_AUTH_MODE)
+            .unwrap_or_else(|| "git".to_string());
         app.load_tabs();
         Ok(app)
     }
@@ -573,6 +634,26 @@ impl eframe::App for ZedeApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.handle_shortcuts(ctx);
 
+        // Sync results land here; the worker already persisted the summary to
+        // meta, so this is just a refresh of everything sync can change.
+        while let Ok(_result) = self.sync_rx.try_recv() {
+            self.sync_busy = false;
+            self.spaces = self.db.list_spaces();
+            self.load_tabs();
+            self.settings = Settings::load(&self.db);
+            let next_theme = theme::theme_by_id(&self.settings.theme);
+            if !std::ptr::eq(next_theme, self.theme) {
+                self.theme = next_theme;
+                if let Ok(mut osc) = self.osc.write() {
+                    *osc = osc_from_theme(next_theme);
+                }
+                apply_visuals(ctx, next_theme);
+            }
+            if self.show_memory {
+                self.reload_memories();
+            }
+        }
+
         let th = self.theme;
         let mut pending: Vec<Action> = Vec::new();
 
@@ -822,8 +903,33 @@ impl eframe::App for ZedeApp {
 
         // --- settings --------------------------------------------------------
         if self.show_settings {
-            let changes =
-                settings_panel::settings_window(ctx, &mut self.show_settings, &self.settings, th);
+            let status = sync::status(&self.db);
+            let sync_ui = settings_panel::SyncUi {
+                configured: status.configured,
+                busy: self.sync_busy,
+                last_result: status.last_result,
+                url: &mut self.sync_url_input,
+                mode: &mut self.sync_mode_input,
+            };
+            let (changes, sync_action) =
+                settings_panel::settings_window(ctx, &mut self.show_settings, &self.settings, th, sync_ui);
+            match sync_action {
+                Some(settings_panel::SyncAction::Connect) => {
+                    self.sync_busy = true;
+                    let _ = self.sync_tx.send(SyncCmd::Setup {
+                        url: self.sync_url_input.clone(),
+                        mode: self.sync_mode_input.clone(),
+                    });
+                }
+                Some(settings_panel::SyncAction::SyncNow) => {
+                    self.sync_busy = true;
+                    let _ = self.sync_tx.send(SyncCmd::Now);
+                }
+                Some(settings_panel::SyncAction::Disconnect) => {
+                    sync::disconnect(&self.db);
+                }
+                None => {}
+            }
             if !changes.is_empty() {
                 let theme_changed = changes.iter().any(|(k, _)| *k == "theme");
                 for (key, value) in &changes {

@@ -19,9 +19,37 @@ pub struct SpaceRow {
     pub id: String,
     pub name: String,
     pub icon: Option<String>,
-    #[allow(dead_code)] // used by drag reordering (P5)
     pub sort_order: i64,
     pub is_default: bool,
+    /// LWW clock for sync (falls back to created_at).
+    pub updated_at: i64,
+    pub created_at: i64,
+}
+
+/// Every durable field of a memory, any status — the sync wire shape.
+#[derive(Clone, Debug, PartialEq)]
+pub struct FullMemoryRow {
+    pub id: String,
+    pub space_id: Option<String>,
+    pub scope: String,
+    pub mtype: String,
+    pub content: String,
+    pub confidence: Option<f64>,
+    pub status: String,
+    pub pinned: bool,
+    pub source_hash: Option<String>,
+    pub created_at: i64,
+    pub edited_at: i64,
+}
+
+#[derive(Clone, Debug)]
+pub struct TombstoneRow {
+    pub fingerprint: String,
+    pub scope: Option<String>,
+    pub space_id: Option<String>,
+    pub reason: Option<String>,
+    pub created_at: i64,
+    pub created_by: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -69,7 +97,7 @@ fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
-const LATEST_VERSION: i64 = 2;
+const LATEST_VERSION: i64 = 3;
 
 const SCHEMA_V1: &str = "
 CREATE TABLE IF NOT EXISTS meta (
@@ -124,6 +152,14 @@ CREATE TABLE IF NOT EXISTS tombstones (
 CREATE INDEX IF NOT EXISTS idx_tombstones_fingerprint ON tombstones(fingerprint);
 ";
 
+// Sync clocks: per-key settings LWW and per-space LWW need edit timestamps
+// (matching the Electron app's schema v6 semantics).
+const SCHEMA_V3: &str = "
+ALTER TABLE settings ADD COLUMN updated_at INTEGER;
+ALTER TABLE spaces ADD COLUMN updated_at INTEGER;
+UPDATE spaces SET updated_at = created_at WHERE updated_at IS NULL;
+";
+
 impl Db {
     pub fn open(path: &Path) -> Result<Db, String> {
         if let Some(parent) = path.parent() {
@@ -132,6 +168,9 @@ impl Db {
         let conn = Connection::open(path).map_err(|e| e.to_string())?;
         conn.pragma_update(None, "journal_mode", "WAL").ok();
         conn.pragma_update(None, "foreign_keys", "ON").ok();
+        // The sync worker opens its own connection; WAL + a busy timeout make
+        // the brief cross-thread writes safe.
+        conn.busy_timeout(std::time::Duration::from_millis(5000)).ok();
         let db = Db { conn };
         db.migrate()?;
         Ok(db)
@@ -155,7 +194,7 @@ impl Db {
         if version >= 1 && !self.has_table("spaces").unwrap_or(false) {
             return Err("database is missing zede tables — not a zede-native db".to_string());
         }
-        let steps: &[(i64, &str)] = &[(1, SCHEMA_V1), (2, SCHEMA_V2)];
+        let steps: &[(i64, &str)] = &[(1, SCHEMA_V1), (2, SCHEMA_V2), (3, SCHEMA_V3)];
         for (v, sql) in steps {
             if version < *v {
                 self.conn.execute_batch(sql).map_err(|e| e.to_string())?;
@@ -188,13 +227,28 @@ impl Db {
     }
 
     pub fn set_setting(&self, key: &str, value: &str) {
+        self.set_setting_with_clock(key, value, now_ms());
+    }
+
+    pub fn set_setting_with_clock(&self, key: &str, value: &str, clock: i64) {
         self.conn
             .execute(
-                "INSERT INTO settings(key, value) VALUES (?1, ?2)
-                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-                params![key, value],
+                "INSERT INTO settings(key, value, updated_at) VALUES (?1, ?2, ?3)
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
+                params![key, value, clock],
             )
             .ok();
+    }
+
+    /// Value + LWW clock for one setting (sync export/import).
+    pub fn get_setting_row(&self, key: &str) -> Option<(String, i64)> {
+        self.conn
+            .query_row(
+                "SELECT value, COALESCE(updated_at, 0) FROM settings WHERE key = ?1",
+                [key],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .ok()
     }
 
     pub fn meta_get(&self, key: &str) -> Option<String> {
@@ -217,7 +271,9 @@ impl Db {
 
     pub fn list_spaces(&self) -> Vec<SpaceRow> {
         let mut stmt = match self.conn.prepare(
-            "SELECT id, name, icon, sort_order, is_default FROM spaces ORDER BY sort_order, created_at",
+            "SELECT id, name, icon, sort_order, is_default,
+                    COALESCE(updated_at, created_at, 0), COALESCE(created_at, 0)
+             FROM spaces ORDER BY sort_order, created_at",
         ) {
             Ok(s) => s,
             Err(_) => return Vec::new(),
@@ -229,6 +285,8 @@ impl Db {
                 icon: r.get(2)?,
                 sort_order: r.get(3)?,
                 is_default: r.get::<_, i64>(4)? != 0,
+                updated_at: r.get(5)?,
+                created_at: r.get(6)?,
             })
         })
         .map(|rows| rows.filter_map(Result::ok).collect())
@@ -237,15 +295,16 @@ impl Db {
 
     pub fn create_space(&self, name: &str, icon: Option<&str>) -> SpaceRow {
         let id = Uuid::new_v4().to_string();
+        let now = now_ms();
         let sort: i64 = self
             .conn
             .query_row("SELECT COALESCE(MAX(sort_order), 0) + 1 FROM spaces", [], |r| r.get(0))
             .unwrap_or(1);
         self.conn
             .execute(
-                "INSERT INTO spaces(id, name, icon, sort_order, is_default, created_at)
-                 VALUES (?1, ?2, ?3, ?4, 0, ?5)",
-                params![id, name, icon, sort, now_ms()],
+                "INSERT INTO spaces(id, name, icon, sort_order, is_default, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, 0, ?5, ?5)",
+                params![id, name, icon, sort, now],
             )
             .ok();
         SpaceRow {
@@ -254,13 +313,48 @@ impl Db {
             icon: icon.map(str::to_string),
             sort_order: sort,
             is_default: false,
+            updated_at: now,
+            created_at: now,
         }
     }
 
     pub fn rename_space(&self, id: &str, name: &str) {
         self.conn
-            .execute("UPDATE spaces SET name = ?2 WHERE id = ?1", params![id, name])
+            .execute(
+                "UPDATE spaces SET name = ?2, updated_at = ?3 WHERE id = ?1",
+                params![id, name, now_ms()],
+            )
             .ok();
+    }
+
+    /// Sync import: update durable space fields (preserving local
+    /// `is_default`), or insert.
+    pub fn upsert_synced_space(
+        &self,
+        id: &str,
+        name: &str,
+        icon: Option<&str>,
+        sort_order: i64,
+        created_at: i64,
+        updated_at: i64,
+    ) {
+        let n = self
+            .conn
+            .execute(
+                "UPDATE spaces SET name = ?2, icon = ?3, sort_order = ?4,
+                        created_at = ?5, updated_at = ?6 WHERE id = ?1",
+                params![id, name, icon, sort_order, created_at, updated_at],
+            )
+            .unwrap_or(0);
+        if n == 0 {
+            self.conn
+                .execute(
+                    "INSERT INTO spaces(id, name, icon, sort_order, is_default, created_at, updated_at)
+                     VALUES (?1, ?2, ?3, ?4, 0, ?5, ?6)",
+                    params![id, name, icon, sort_order, created_at, updated_at],
+                )
+                .ok();
+        }
     }
 
     pub fn delete_space(&self, id: &str) {
@@ -483,6 +577,185 @@ impl Db {
         self.conn
             .query_row("SELECT COUNT(*) FROM tombstones", [], |r| r.get(0))
             .unwrap_or(0)
+    }
+
+    // --- sync surface -------------------------------------------------------
+
+    /// Every memory, every status — soft-deleted rows keep their content
+    /// locally and their status must propagate.
+    pub fn all_memories_sync(&self) -> Vec<FullMemoryRow> {
+        let mut stmt = match self.conn.prepare(
+            "SELECT id, space_id, scope, type, content, confidence, status, pinned,
+                    source_hash, COALESCE(created_at, 0),
+                    COALESCE(edited_at, updated_at, created_at, 0)
+             FROM memories",
+        ) {
+            Ok(s) => s,
+            Err(_) => return Vec::new(),
+        };
+        stmt.query_map([], |r| {
+            Ok(FullMemoryRow {
+                id: r.get(0)?,
+                space_id: r.get(1)?,
+                scope: r.get(2)?,
+                mtype: r.get(3)?,
+                content: r.get(4)?,
+                confidence: r.get(5)?,
+                status: r.get(6)?,
+                pinned: r.get::<_, i64>(7)? != 0,
+                source_hash: r.get(8)?,
+                created_at: r.get(9)?,
+                edited_at: r.get(10)?,
+            })
+        })
+        .map(|rows| rows.filter_map(Result::ok).collect())
+        .unwrap_or_default()
+    }
+
+    pub fn get_memory_sync(&self, id: &str) -> Option<FullMemoryRow> {
+        self.conn
+            .query_row(
+                "SELECT id, space_id, scope, type, content, confidence, status, pinned,
+                        source_hash, COALESCE(created_at, 0),
+                        COALESCE(edited_at, updated_at, created_at, 0)
+                 FROM memories WHERE id = ?1",
+                [id],
+                |r| {
+                    Ok(FullMemoryRow {
+                        id: r.get(0)?,
+                        space_id: r.get(1)?,
+                        scope: r.get(2)?,
+                        mtype: r.get(3)?,
+                        content: r.get(4)?,
+                        confidence: r.get(5)?,
+                        status: r.get(6)?,
+                        pinned: r.get::<_, i64>(7)? != 0,
+                        source_hash: r.get(8)?,
+                        created_at: r.get(9)?,
+                        edited_at: r.get(10)?,
+                    })
+                },
+            )
+            .ok()
+    }
+
+    /// Sync import: update durable fields (local ranking signals —
+    /// use_count/salience/last_used_at — are never touched), or insert.
+    pub fn upsert_synced_memory(&self, m: &FullMemoryRow, now: i64) {
+        let n = self
+            .conn
+            .execute(
+                "UPDATE memories SET space_id = ?2, scope = ?3, type = ?4, content = ?5,
+                        confidence = ?6, status = ?7, pinned = ?8, source_hash = ?9,
+                        created_at = ?10, edited_at = ?11, updated_at = ?12
+                 WHERE id = ?1",
+                params![
+                    m.id, m.space_id, m.scope, m.mtype, m.content, m.confidence,
+                    m.status, m.pinned as i64, m.source_hash, m.created_at,
+                    m.edited_at, now
+                ],
+            )
+            .unwrap_or(0);
+        if n == 0 {
+            self.conn
+                .execute(
+                    "INSERT INTO memories(id, space_id, scope, type, content, confidence,
+                         status, pinned, use_count, source_hash, created_at, updated_at,
+                         edited_at)
+                     VALUES (?1,?2,?3,?4,?5,?6,?7,?8,0,?9,?10,?11,?12)",
+                    params![
+                        m.id, m.space_id, m.scope, m.mtype, m.content, m.confidence,
+                        m.status, m.pinned as i64, m.source_hash, m.created_at, now,
+                        m.edited_at
+                    ],
+                )
+                .ok();
+        }
+    }
+
+    pub fn all_tombstones(&self) -> Vec<TombstoneRow> {
+        let mut stmt = match self.conn.prepare(
+            "SELECT fingerprint, scope, space_id, reason, COALESCE(created_at, 0), created_by
+             FROM tombstones",
+        ) {
+            Ok(s) => s,
+            Err(_) => return Vec::new(),
+        };
+        stmt.query_map([], |r| {
+            Ok(TombstoneRow {
+                fingerprint: r.get(0)?,
+                scope: r.get(1)?,
+                space_id: r.get(2)?,
+                reason: r.get(3)?,
+                created_at: r.get(4)?,
+                created_by: r.get(5)?,
+            })
+        })
+        .map(|rows| rows.filter_map(Result::ok).collect())
+        .unwrap_or_default()
+    }
+
+    /// Active rows sharing a fingerprint, with their edit clocks.
+    pub fn actives_by_fingerprint(&self, fingerprint: &str) -> Vec<(String, i64)> {
+        let mut stmt = match self.conn.prepare(
+            "SELECT id, COALESCE(edited_at, updated_at, created_at, 0)
+             FROM memories WHERE source_hash = ?1 AND status = 'active'",
+        ) {
+            Ok(s) => s,
+            Err(_) => return Vec::new(),
+        };
+        stmt.query_map([fingerprint], |r| Ok((r.get(0)?, r.get(1)?)))
+            .map(|rows| rows.filter_map(Result::ok).collect())
+            .unwrap_or_default()
+    }
+
+    pub fn mark_tombstoned(&self, id: &str, now: i64) {
+        self.conn
+            .execute(
+                "UPDATE memories SET status = 'tombstoned', edited_at = ?2, updated_at = ?2
+                 WHERE id = ?1",
+                params![id, now],
+            )
+            .ok();
+    }
+
+    /// Union semantics keyed on (fingerprint, created_at): a fresh forget
+    /// decision inserts; the same decision syncing back does not.
+    pub fn insert_tombstone_if_absent(&self, t: &TombstoneRow) -> bool {
+        let exists: i64 = self
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM tombstones WHERE fingerprint = ?1 AND created_at = ?2",
+                params![t.fingerprint, t.created_at],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
+        if exists > 0 {
+            return false;
+        }
+        self.conn
+            .execute(
+                "INSERT INTO tombstones(id, fingerprint, scope, space_id, reason, created_at, created_by)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    Uuid::new_v4().to_string(),
+                    t.fingerprint,
+                    t.scope,
+                    t.space_id,
+                    t.reason.clone().unwrap_or_else(|| "synced forget".into()),
+                    t.created_at,
+                    t.created_by.clone().unwrap_or_else(|| "sync".into())
+                ],
+            )
+            .is_ok()
+    }
+
+    /// Run a closure inside one transaction (sync import).
+    pub fn transaction<T>(&self, f: impl FnOnce() -> T) -> T {
+        let _ = self.conn.execute_batch("BEGIN");
+        let out = f();
+        let _ = self.conn.execute_batch("COMMIT");
+        out
     }
 
     // --- Electron import ----------------------------------------------------

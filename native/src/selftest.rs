@@ -696,6 +696,256 @@ fn check_context_writer() -> Result<(), String> {
     Ok(())
 }
 
+fn check_sync_format_roundtrip() -> Result<(), String> {
+    use crate::db::FullMemoryRow;
+    use crate::sync::format::{parse_memory_file, safe_name, serialize_memory};
+    let m = FullMemoryRow {
+        id: "abc-123".into(),
+        space_id: Some("sp1".into()),
+        scope: "space".into(),
+        mtype: "decision".into(),
+        content: "Line one\nLine two".into(),
+        confidence: Some(0.62),
+        status: "active".into(),
+        pinned: true,
+        source_hash: Some("deadbeef".into()),
+        created_at: 100,
+        edited_at: 200,
+    };
+    let back = parse_memory_file(&serialize_memory(&m)).ok_or("roundtrip parse")?;
+    expect(back == m, "serialize -> parse roundtrips all durable fields")?;
+
+    let mut g = m.clone();
+    g.space_id = None;
+    g.confidence = None;
+    g.pinned = false;
+    let back = parse_memory_file(&serialize_memory(&g)).ok_or("global parse")?;
+    expect(
+        back.space_id.is_none() && back.confidence.is_none() && !back.pinned,
+        "~ fields roundtrip as None",
+    )?;
+
+    expect(parse_memory_file("no frontmatter here").is_none(), "malformed rejected")?;
+    expect(
+        parse_memory_file("---\nid: x\ncreated_at: 1\nedited_at: 1\n---\nenc1:zzz\n").is_none(),
+        "encrypted body rejected (unsupported)",
+    )?;
+    expect(safe_name("simple-id_1.x") == "simple-id_1.x", "clean ids map to themselves")?;
+    let a = safe_name("cc:one");
+    let b = safe_name("cc_one");
+    expect(
+        a != b && a.starts_with("cc_one-"),
+        "sanitized ids get a disambiguating hash",
+    )?;
+    Ok(())
+}
+
+fn check_sync_export() -> Result<(), String> {
+    use crate::db::TombstoneRow;
+    use crate::sync::format::export_tree;
+    let (db, dir) = temp_db()?;
+    let space = db.create_space("Exp", None);
+    db.insert_memory(
+        Some(&space.id),
+        "space",
+        "fact",
+        "the password: supersecret123 lives in prod",
+        None,
+        Some("fp-x"),
+    );
+    for created in [10, 20] {
+        db.insert_tombstone_if_absent(&TombstoneRow {
+            fingerprint: "f1".into(),
+            scope: None,
+            space_id: None,
+            reason: Some("test".into()),
+            created_at: created,
+            created_by: Some("test".into()),
+        });
+    }
+    db.set_setting("fontSize", "16");
+
+    let t1 = export_tree(&db);
+    let t2 = export_tree(&db);
+    expect(t1 == t2, "same db state exports byte-identical trees")?;
+    expect(t1.contains_key("zede.json"), "manifest present")?;
+    let mem_file = t1
+        .iter()
+        .find(|(k, _)| k.starts_with("memories/"))
+        .map(|(_, v)| v.clone())
+        .ok_or("memory exported")?;
+    expect(
+        !mem_file.contains("supersecret123") && mem_file.contains("[REDACTED:secret-kv]"),
+        "redaction runs on the way out",
+    )?;
+    let ts = t1.get("tombstones/f1.json").ok_or("tombstone exported")?;
+    expect(
+        ts.contains("\"createdAt\": 20"),
+        "latest forget decision per fingerprint wins",
+    )?;
+    expect(
+        t1.get("settings.json").map(|s| s.contains("fontSize")).unwrap_or(false),
+        "synced settings exported",
+    )?;
+    let _ = std::fs::remove_dir_all(dir);
+    Ok(())
+}
+
+fn check_sync_merge_rules() -> Result<(), String> {
+    use crate::db::{FullMemoryRow, TombstoneRow};
+    use crate::sync::format::{Encryption, SyncTree, SyncedSetting};
+    use crate::sync::merge::import_tree;
+
+    let (db, dir) = temp_db()?;
+    let full = |id: &str, content: &str, hash: &str, edited: i64| FullMemoryRow {
+        id: id.into(),
+        space_id: None,
+        scope: "global".into(),
+        mtype: "fact".into(),
+        content: content.into(),
+        confidence: None,
+        status: "active".into(),
+        pinned: false,
+        source_hash: Some(hash.into()),
+        created_at: 50,
+        edited_at: edited,
+    };
+    let tree = |memories: Vec<FullMemoryRow>, tombstones: Vec<TombstoneRow>| SyncTree {
+        encryption: Encryption::None,
+        memories,
+        tombstones,
+        spaces: Vec::new(),
+        settings: std::collections::BTreeMap::new(),
+    };
+
+    db.upsert_synced_memory(&full("m1", "old content", "h1", 100), 100);
+
+    let res = import_tree(&db, &tree(vec![full("m1", "newer content", "h1", 200)], vec![]), 999);
+    expect(res.memories_updated == 1, "newer remote edit wins")?;
+    expect(
+        db.get_memory_sync("m1").map(|m| m.content) == Some("newer content".into()),
+        "content updated",
+    )?;
+
+    import_tree(&db, &tree(vec![full("m1", "stale content", "h1", 150)], vec![]), 999);
+    expect(
+        db.get_memory_sync("m1").map(|m| m.content) == Some("newer content".into()),
+        "older remote edit loses",
+    )?;
+
+    import_tree(&db, &tree(vec![full("m1", "zzz tie winner", "h1", 200)], vec![]), 999);
+    expect(
+        db.get_memory_sync("m1").map(|m| m.content) == Some("zzz tie winner".into()),
+        "equal clocks tie-break on content symmetrically",
+    )?;
+
+    // Never resurrect: a tombstoned fingerprint blocks an unknown id.
+    db.insert_tombstone_if_absent(&TombstoneRow {
+        fingerprint: "h2".into(),
+        scope: None,
+        space_id: None,
+        reason: None,
+        created_at: 500,
+        created_by: None,
+    });
+    import_tree(&db, &tree(vec![full("m2", "raised from the dead", "h2", 999)], vec![]), 999);
+    expect(db.get_memory_sync("m2").is_none(), "forgotten fingerprints never resurrect")?;
+
+    // Tombstone clock guard.
+    db.upsert_synced_memory(&full("m3", "dies", "h3", 100), 100);
+    db.upsert_synced_memory(&full("m4", "survives", "h4", 300), 300);
+    let ts = |fp: &str, created: i64| TombstoneRow {
+        fingerprint: fp.into(),
+        scope: None,
+        space_id: None,
+        reason: None,
+        created_at: created,
+        created_by: None,
+    };
+    let res = import_tree(&db, &tree(vec![], vec![ts("h3", 200), ts("h4", 200)]), 999);
+    expect(res.tombstones_applied == 1, "exactly one forget applies")?;
+    expect(
+        db.get_memory_sync("m3").map(|m| m.status) == Some("tombstoned".into()),
+        "older local edit dies to the forget",
+    )?;
+    expect(
+        db.get_memory_sync("m4").map(|m| m.status) == Some("active".into()),
+        "newer local edit survives the forget (undo semantics)",
+    )?;
+
+    // Settings LWW with normalization.
+    let mut settings = std::collections::BTreeMap::new();
+    settings.insert("fontSize".to_string(), SyncedSetting { value: "18".into(), edited_at: 5_000 });
+    settings.insert("fontSize2".to_string(), SyncedSetting { value: "18".into(), edited_at: 5_000 });
+    settings.insert("theme".to_string(), SyncedSetting { value: "not-a-theme".into(), edited_at: 5_000 });
+    let mut t = tree(vec![], vec![]);
+    t.settings = settings;
+    let res = import_tree(&db, &t, 999);
+    expect(res.settings_changed == 1, "unknown keys and invalid values never land")?;
+    expect(
+        db.get_setting("fontSize").as_deref() == Some("18"),
+        "valid synced setting applied",
+    )?;
+    let _ = std::fs::remove_dir_all(dir);
+    Ok(())
+}
+
+#[cfg(unix)]
+fn check_sync_end_to_end() -> Result<(), String> {
+    use crate::sync;
+    let base = std::env::temp_dir().join(format!("zede-selftest-{}", uuid::Uuid::new_v4()));
+    let (root_a, root_b) = (base.join("a"), base.join("b"));
+    std::fs::create_dir_all(&root_a).map_err(|e| e.to_string())?;
+    std::fs::create_dir_all(&root_b).map_err(|e| e.to_string())?;
+    let bare = base.join("remote.git");
+    let out = std::process::Command::new("git")
+        .args(["init", "--bare", &bare.to_string_lossy()])
+        .output()
+        .map_err(|e| e.to_string())?;
+    expect(out.status.success(), "bare remote created")?;
+    let remote = bare.to_string_lossy().to_string();
+
+    // Machine A learns a memory and syncs.
+    let db_a = Db::open(&root_a.join("zede.db"))?;
+    let space = db_a.create_space("Shared", None);
+    let n = extract::learn_from_text(&db_a, &space.id, "we decided to sync natively over git");
+    expect(n == 1, "A learned a memory")?;
+    db_a.set_setting("fontSize", "16");
+    let res_a = sync::setup(&db_a, &root_a, &remote, "git");
+    expect(res_a.ok, &format!("A first sync ok: {:?}", res_a.error))?;
+    expect(res_a.pushed, "A pushed its tree")?;
+
+    // Machine B joins and receives everything.
+    let db_b = Db::open(&root_b.join("zede.db"))?;
+    let res_b = sync::setup(&db_b, &root_b, &remote, "git");
+    expect(res_b.ok, &format!("B sync ok: {:?}", res_b.error))?;
+    expect(res_b.counts.memories_added == 1, "B received the memory")?;
+    expect(res_b.counts.spaces_changed == 1, "B received the space")?;
+    expect(
+        db_b.get_setting("fontSize").as_deref() == Some("16"),
+        "B received the setting",
+    )?;
+    let row = db_b
+        .all_memories_sync()
+        .into_iter()
+        .find(|m| m.content.contains("sync natively"))
+        .ok_or("B has the row")?;
+
+    // B forgets; the forget propagates back to A.
+    db_b.forget_memory(&row.id, "test forget");
+    let res_b2 = sync::sync_now(&db_b, &root_b);
+    expect(res_b2.ok, "B second sync ok")?;
+    let res_a2 = sync::sync_now(&db_a, &root_a);
+    expect(res_a2.ok, "A second sync ok")?;
+    expect(res_a2.counts.tombstones_applied == 1, "the forget applied on A")?;
+    expect(
+        db_a.get_memory_sync(&row.id).map(|m| m.status) == Some("tombstoned".into()),
+        "A's row is tombstoned — deletions are authoritative",
+    )?;
+    let _ = std::fs::remove_dir_all(base);
+    Ok(())
+}
+
 #[cfg(unix)]
 fn check_pty_end_to_end() -> Result<(), String> {
     let osc = Arc::new(RwLock::new(osc_from_theme(theme::theme_by_id("one-dark"))));
@@ -767,9 +1017,13 @@ pub fn run() -> i32 {
         ("learn pipeline dedupe + suppression", check_learn_pipeline),
         ("ranker token budget", check_ranker_budget),
         ("context writer + CLAUDE.md wiring", check_context_writer),
+        ("sync format roundtrip", check_sync_format_roundtrip),
+        ("sync export determinism + redaction", check_sync_export),
+        ("sync merge rules", check_sync_merge_rules),
     ];
     #[cfg(unix)]
     {
+        checks.push(("sync end-to-end (two dbs, bare repo)", check_sync_end_to_end));
         checks.push(("pty end-to-end", check_pty_end_to_end));
         checks.push(("pty scrollback", check_pty_scrollback));
     }
