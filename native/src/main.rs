@@ -44,7 +44,7 @@ fn main() {
 
     let viewport = egui::ViewportBuilder::default()
         .with_title("Zede")
-        .with_app_id("dev.zede.Zede")
+        .with_app_id("com.zede.native")
         .with_inner_size(egui::vec2(1280.0, 820.0))
         .with_min_inner_size(egui::vec2(640.0, 400.0));
 

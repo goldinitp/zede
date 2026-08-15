@@ -19,11 +19,22 @@ builds are seconds. The binary lands at `target/release/zede` and is fully
 self-contained (SQLite is compiled in; there are no native-module or signing
 steps). Locally built binaries run without notarization.
 
+## Install as an app (macOS)
+
+```bash
+./scripts/bundle-mac.sh          # -> target/bundle/Zede.app
+./scripts/bundle-mac.sh --dmg    # also builds Zede-<version>.dmg
+```
+
+Drag `Zede.app` to /Applications. The bundle is ad-hoc signed; locally built
+apps run without notarization. Its bundle id is `com.zede.native`, so it
+coexists with the Electron app (`com.zede.app`).
+
 ## Checks
 
 ```bash
-cargo test            # unit tests
-cargo run -- --selftest   # headless end-to-end checks (PTY, grid, db, keys)
+cargo run -- --selftest   # headless end-to-end checks (PTY, grid, db, memory)
+zede --import-electron    # one-way import of the Electron app's memories
 ```
 
 ## Where things live

@@ -75,8 +75,12 @@ performance. This document is the working plan; `README.md` covers building.
   watcher for sessions Zede didn't spawn, FTS + semantic ranking terms.
 - **P7 — sync**: git-backed sync port (device-flow auth, merge rules,
   tombstones, optional encryption).
-- **P8 — packaging**: `.app` bundle + icon + dmg; CI matrix (macOS arm64/x64,
-  Windows — ConPTY comes free, Linux); release docs.
+- **P8 — packaging**: `scripts/bundle-mac.sh` builds an ad-hoc-signed
+  `Zede.app` (bundle id `com.zede.native`, Electron's icon.icns, Info.plist)
+  and optionally a DMG. ✅
+  Remaining: CI matrix (macOS arm64/x64, Windows — ConPTY comes free,
+  Linux), release docs, Developer-ID signing/notarization when a cert
+  exists.
 
 P1–P5 are implemented in this crate now; P6+ have seams (`db` schema fields,
 session ids, transcript paths, the capture parser) already in place.
