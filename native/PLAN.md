@@ -66,9 +66,13 @@ performance. This document is the working plan; `README.md` covers building.
   rule-for-rule), memory sidebar (⌘M: search, pin, forget), and the one-way
   read-only Electron importer (UI button + `zede --import-electron`;
   verified against the real db: 2,415 memories). ✅
-  Remaining: extraction (`claude -p` / heuristic over captured spans, using
-  the P5 parser + redaction), the `notify` watcher for sessions Zede didn't
-  spawn, and the `.zede/context.md` injection writer.
+  The loop is closed: heuristic extraction runs over captured prompts
+  (redact → extract → fingerprint-dedupe vs rows AND tombstones → store),
+  and the ranked context writer (pin/recency/frequency/scope/salience,
+  1500-token budget) regenerates `.zede/context.md` + the managed
+  `CLAUDE.md` block on every claude tab spawn. ✅
+  Remaining: the `claude -p` extractor tier (higher recall), the `notify`
+  watcher for sessions Zede didn't spawn, FTS + semantic ranking terms.
 - **P7 — sync**: git-backed sync port (device-flow auth, merge rules,
   tombstones, optional encryption).
 - **P8 — packaging**: `.app` bundle + icon + dmg; CI matrix (macOS arm64/x64,

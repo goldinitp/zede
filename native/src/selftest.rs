@@ -9,8 +9,9 @@ use egui::Color32;
 
 use crate::app::osc_from_theme;
 use crate::capture::{prompt_from_line, PromptFeed};
-use crate::db::Db;
+use crate::db::{Db, MemoryRow};
 use crate::redact::redact;
+use crate::{extract, inject};
 use crate::pty::{self, TabKind};
 use crate::settings::{normalize_setting_value, Settings};
 use crate::term::TermSession;
@@ -401,10 +402,10 @@ fn check_redaction() -> Result<(), String> {
 fn check_memory_crud() -> Result<(), String> {
     let (db, dir) = temp_db()?;
     let space = db.create_space("Mem", None);
-    let a = db.insert_memory(Some(&space.id), "space", "fact", "space-scoped fact");
-    let _b = db.insert_memory(None, "global", "decision", "global decision");
+    let a = db.insert_memory(Some(&space.id), "space", "fact", "space-scoped fact", None, None);
+    let _b = db.insert_memory(None, "global", "decision", "global decision", None, None);
     let other = db.create_space("Other", None);
-    let _c = db.insert_memory(Some(&other.id), "space", "fact", "other space fact");
+    let _c = db.insert_memory(Some(&other.id), "space", "fact", "other space fact", None, None);
 
     let rows = db.list_memories(&space.id);
     expect(rows.len() == 2, "space sees own + global rows")?;
@@ -484,6 +485,148 @@ fn check_electron_import() -> Result<(), String> {
     Ok(())
 }
 
+fn check_heuristic_extractor() -> Result<(), String> {
+    let span = "I prefer tabs over spaces for indentation, always. \
+                We decided to use pnpm for this repo. \
+                my name is Goldi and that's that. \
+                need to fix the login bug before friday. \
+                I prefer tabs over spaces for indentation, always.";
+    let out = extract::extract(span);
+    let types: Vec<&str> = out.iter().map(|c| c.mtype).collect();
+    expect(types.contains(&"preference"), "preference rule fires")?;
+    expect(types.contains(&"decision"), "decision rule fires")?;
+    expect(types.contains(&"entity"), "entity (name) rule fires")?;
+    expect(types.contains(&"todo"), "todo rule fires")?;
+    let name = out.iter().find(|c| c.mtype == "entity").ok_or("entity candidate")?;
+    expect(
+        name.scope_hint == extract::ScopeHint::Global,
+        "name entity is globally scoped",
+    )?;
+    for c in &out {
+        expect(
+            c.content.chars().next().map(|ch| ch.is_uppercase() || !ch.is_alphabetic()).unwrap_or(false),
+            "candidates are capitalized",
+        )?;
+        expect(
+            c.content.ends_with(['.', '!', '?']),
+            "candidates end with punctuation",
+        )?;
+    }
+    let dupes = out
+        .iter()
+        .filter(|c| c.content.to_lowercase().contains("tabs over spaces"))
+        .count();
+    expect(dupes == 1, "duplicate matches dedupe")?;
+    expect(extract::extract("short").is_empty(), "fragments dropped")?;
+    Ok(())
+}
+
+fn check_learn_pipeline() -> Result<(), String> {
+    let (db, dir) = temp_db()?;
+    let space = db.create_space("Learn", None);
+
+    let n = extract::learn_from_text(&db, &space.id, "we decided to use pnpm for this repo");
+    expect(n == 1, "decision learned")?;
+    let again = extract::learn_from_text(&db, &space.id, "We DECIDED to use pnpm for this repo!");
+    expect(again == 0, "fingerprint dedupe suppresses re-derivation")?;
+
+    let rows = db.list_memories(&space.id);
+    expect(rows.len() == 1 && rows[0].mtype == "decision", "stored as a decision")?;
+    let id = rows[0].id.clone();
+    db.forget_memory(&id, "test");
+    let n = extract::learn_from_text(&db, &space.id, "we decided to use pnpm for this repo");
+    expect(n == 0, "tombstoned fingerprint never returns")?;
+
+    let n = extract::learn_from_text(
+        &db,
+        &space.id,
+        "we decided to use token=sk-ant-abc123def456ghi789jkl012 here",
+    );
+    if n > 0 {
+        let rows = db.list_memories(&space.id);
+        expect(
+            rows.iter().all(|m| !m.content.contains("sk-ant-")),
+            "redaction runs before storage",
+        )?;
+    }
+    let _ = std::fs::remove_dir_all(dir);
+    Ok(())
+}
+
+fn mem_row(content: &str, mtype: &str, pinned: bool, salience: Option<f64>) -> MemoryRow {
+    MemoryRow {
+        id: uuid::Uuid::new_v4().to_string(),
+        space_id: None,
+        scope: "space".into(),
+        mtype: mtype.into(),
+        content: content.into(),
+        pinned,
+        use_count: 0,
+        confidence: None,
+        salience,
+        created_at: Some(0),
+        updated_at: Some(0),
+        last_used_at: None,
+    }
+}
+
+fn check_ranker_budget() -> Result<(), String> {
+    let mut rows = vec![mem_row("pinned but low salience", "fact", true, Some(0.0))];
+    for i in 0..200 {
+        rows.push(mem_row(
+            &format!("unpinned filler memory number {i} with some extra words to cost tokens"),
+            "fact",
+            false,
+            Some(0.9),
+        ));
+    }
+    let selected = inject::select(&rows, 0);
+    expect(selected[0].pinned, "pinned row selected first despite low score")?;
+    let tokens: usize = selected.iter().map(|r| inject::est_tokens(&r.content)).sum();
+    expect(tokens <= 1500 + 600, "selection respects the token budget")?;
+    expect(selected.len() < rows.len(), "over-budget rows are dropped")?;
+    Ok(())
+}
+
+fn check_context_writer() -> Result<(), String> {
+    let dir = std::env::temp_dir().join(format!("zede-selftest-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(dir.join(".git")).map_err(|e| e.to_string())?;
+    std::fs::write(
+        dir.join("CLAUDE.md"),
+        "# My project\n\nSome instructions.\n\n<!-- loom:begin (managed — do not edit) -->\n@.loom/context.md\n<!-- loom:end -->\n",
+    )
+    .map_err(|e| e.to_string())?;
+
+    let rows = vec![
+        mem_row("Use pnpm not npm", "preference", true, None),
+        mem_row("Ship the native rust port", "decision", false, None),
+    ];
+    let cwd = dir.to_string_lossy().to_string();
+    inject::write_context(&cwd, &rows, "Default");
+
+    let ctx = std::fs::read_to_string(dir.join(".zede/context.md")).map_err(|e| e.to_string())?;
+    expect(ctx.starts_with("# Zede memory — Default"), "context header")?;
+    expect(ctx.contains("## Preferences") && ctx.contains("📌 Use pnpm not npm"), "pinned preference rendered")?;
+    expect(ctx.contains("## Decisions"), "decision section rendered")?;
+
+    let claude_md = std::fs::read_to_string(dir.join("CLAUDE.md")).map_err(|e| e.to_string())?;
+    expect(claude_md.contains("# My project"), "existing CLAUDE.md content kept")?;
+    expect(claude_md.contains("@.zede/context.md"), "import line added")?;
+    expect(!claude_md.contains("loom:begin"), "legacy loom block stripped")?;
+
+    let gi = std::fs::read_to_string(dir.join(".gitignore")).map_err(|e| e.to_string())?;
+    expect(gi.contains(".zede/"), "gitignore wired")?;
+
+    inject::write_context(&cwd, &rows, "Default");
+    let claude_md2 = std::fs::read_to_string(dir.join("CLAUDE.md")).map_err(|e| e.to_string())?;
+    expect(
+        claude_md2.matches("zede:begin").count() == 1,
+        "managed block not duplicated on rewrite",
+    )?;
+    let _ = std::fs::remove_dir_all(dir);
+    Ok(())
+}
+
 #[cfg(unix)]
 fn check_pty_end_to_end() -> Result<(), String> {
     let osc = Arc::new(RwLock::new(osc_from_theme(theme::theme_by_id("one-dark"))));
@@ -549,6 +692,10 @@ pub fn run() -> i32 {
         ("secret redaction", check_redaction),
         ("memory crud + tombstones", check_memory_crud),
         ("electron db import", check_electron_import),
+        ("heuristic extractor", check_heuristic_extractor),
+        ("learn pipeline dedupe + suppression", check_learn_pipeline),
+        ("ranker token budget", check_ranker_budget),
+        ("context writer + CLAUDE.md wiring", check_context_writer),
     ];
     #[cfg(unix)]
     {

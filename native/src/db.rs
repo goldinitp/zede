@@ -33,8 +33,12 @@ pub struct MemoryRow {
     pub mtype: String,
     pub content: String,
     pub pinned: bool,
-    #[allow(dead_code)] // shown in detail view (P6 continuation)
+    pub use_count: i64,
+    pub confidence: Option<f64>,
+    pub salience: Option<f64>,
     pub created_at: Option<i64>,
+    pub updated_at: Option<i64>,
+    pub last_used_at: Option<i64>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -48,7 +52,6 @@ pub struct ImportReport {
 #[derive(Clone, Debug)]
 pub struct TabRow {
     pub id: String,
-    #[allow(dead_code)] // used by tab move/duplicate (P5)
     pub space_id: String,
     pub kind: TabKind,
     pub title: String,
@@ -360,7 +363,8 @@ impl Db {
     /// first, most recently edited first. Capped like the Electron sidebar.
     pub fn list_memories(&self, space_id: &str) -> Vec<MemoryRow> {
         let mut stmt = match self.conn.prepare(
-            "SELECT id, space_id, scope, type, content, pinned, created_at
+            "SELECT id, space_id, scope, type, content, pinned, use_count,
+                    confidence, salience, created_at, updated_at, last_used_at
              FROM memories
              WHERE (space_id = ?1 OR space_id IS NULL) AND status = 'active'
              ORDER BY pinned DESC, COALESCE(edited_at, updated_at, created_at) DESC
@@ -377,7 +381,12 @@ impl Db {
                 mtype: r.get(3)?,
                 content: r.get(4)?,
                 pinned: r.get::<_, i64>(5)? != 0,
-                created_at: r.get(6)?,
+                use_count: r.get(6)?,
+                confidence: r.get(7)?,
+                salience: r.get(8)?,
+                created_at: r.get(9)?,
+                updated_at: r.get(10)?,
+                last_used_at: r.get(11)?,
             })
         })
         .map(|rows| rows.filter_map(Result::ok).collect())
@@ -390,18 +399,45 @@ impl Db {
         scope: &str,
         mtype: &str,
         content: &str,
+        confidence: Option<f64>,
+        source_hash: Option<&str>,
     ) -> String {
         let id = Uuid::new_v4().to_string();
         let now = now_ms();
         self.conn
             .execute(
-                "INSERT INTO memories(id, space_id, scope, type, content, status, pinned,
-                                      use_count, created_at, updated_at, edited_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, 'active', 0, 0, ?6, ?6, ?6)",
-                params![id, space_id, scope, mtype, content, now],
+                "INSERT INTO memories(id, space_id, scope, type, content, confidence,
+                                      source_hash, status, pinned, use_count,
+                                      created_at, updated_at, edited_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'active', 0, 0, ?8, ?8, ?8)",
+                params![id, space_id, scope, mtype, content, confidence, source_hash, now],
             )
             .ok();
         id
+    }
+
+    /// Any memory (any status) already derived from this fingerprint?
+    pub fn has_memory_with_hash(&self, hash: &str) -> bool {
+        self.conn
+            .query_row(
+                "SELECT COUNT(*) FROM memories WHERE source_hash = ?1",
+                [hash],
+                |r| r.get::<_, i64>(0),
+            )
+            .map(|n| n > 0)
+            .unwrap_or(false)
+    }
+
+    /// Was this fingerprint ever forgotten? (Suppresses re-derivation.)
+    pub fn has_tombstone(&self, fingerprint: &str) -> bool {
+        self.conn
+            .query_row(
+                "SELECT COUNT(*) FROM tombstones WHERE fingerprint = ?1",
+                [fingerprint],
+                |r| r.get::<_, i64>(0),
+            )
+            .map(|n| n > 0)
+            .unwrap_or(false)
     }
 
     pub fn set_memory_pinned(&self, id: &str, pinned: bool) {

@@ -3,6 +3,8 @@
 mod app;
 mod capture;
 mod db;
+mod extract;
+mod inject;
 mod pty;
 mod redact;
 mod selftest;

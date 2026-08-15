@@ -5,12 +5,15 @@
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
+use std::time::Instant;
 
 use alacritty_terminal::vte::ansi::{CursorShape as AnsiCursorShape, CursorStyle as AnsiCursorStyle};
 use egui::{Align2, Color32, CornerRadius, Frame, Key, Modifiers, RichText, Vec2};
 
 use crate::capture::PromptFeed;
 use crate::db::{Db, MemoryRow, SpaceRow, TabRow};
+use crate::extract;
+use crate::inject;
 use crate::pty::{self, TabKind};
 use crate::settings::{self, CursorStyleKind, Settings};
 use crate::term::{OscColors, TermSession};
@@ -41,6 +44,9 @@ pub struct ZedeApp {
     memory_filter: String,
     electron_db_available: bool,
     import_report: Option<String>,
+    /// How many of each feed's prompts have been through the learn pipeline.
+    extracted_upto: HashMap<String, usize>,
+    last_learned: Option<(Instant, usize)>,
     focus_terminal: bool,
 }
 
@@ -184,6 +190,8 @@ impl ZedeApp {
             memory_filter: String::new(),
             electron_db_available: electron_db_path().exists(),
             import_report: None,
+            extracted_upto: HashMap::new(),
+            last_learned: None,
             focus_terminal: true,
         };
         app.load_tabs();
@@ -264,6 +272,25 @@ impl ZedeApp {
         if self.sessions.contains_key(&tab.id) || self.spawn_errors.contains_key(&tab.id) {
             return;
         }
+        // Inject this Space's ranked memory before the session starts, so the
+        // spawning claude reads current context (file adapter: CLAUDE.md
+        // imports .zede/context.md).
+        if tab.kind == TabKind::Claude {
+            let space_name = self
+                .spaces
+                .iter()
+                .find(|s| s.id == tab.space_id)
+                .map(|s| s.name.clone())
+                .unwrap_or_else(|| "Default".to_string());
+            let rows = self.db.list_memories(&tab.space_id);
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as i64)
+                .unwrap_or(0);
+            let selected = inject::select(&rows, now);
+            inject::write_context(&tab.cwd, &selected, &space_name);
+        }
+
         let fresh_only = self.no_resume_once.remove(&tab.id);
         let resume = if !fresh_only
             && tab.kind == TabKind::Claude
@@ -544,12 +571,26 @@ impl eframe::App for ZedeApp {
         let th = self.theme;
         let mut pending: Vec<Action> = Vec::new();
 
-        // --- prompt navigator: poll the active chat's transcript -------------
-        if self.sidebar_visible {
+        // --- capture: poll the active chat's transcript; learn from new
+        // prompts (redact -> extract -> fingerprint-dedupe -> store) ----------
+        {
             let mut auto_title: Option<(String, String)> = None;
+            let mut learned = 0usize;
             if let Some(tab) = self.current_tab() {
                 if let Some(feed) = self.prompt_feeds.get_mut(&tab.id) {
-                    feed.poll();
+                    if feed.poll() {
+                        let upto = self
+                            .extracted_upto
+                            .get(&tab.id)
+                            .copied()
+                            .unwrap_or(0)
+                            .min(feed.prompts.len());
+                        for prompt in &feed.prompts[upto..] {
+                            learned +=
+                                extract::learn_from_text(&self.db, &self.active_space, &prompt.text);
+                        }
+                        self.extracted_upto.insert(tab.id.clone(), feed.prompts.len());
+                    }
                     // Default-titled chats take their first prompt as a title.
                     if tab.title == "New chat" {
                         if let Some(first) = feed.prompts.first() {
@@ -567,6 +608,12 @@ impl eframe::App for ZedeApp {
             if let Some((id, title)) = auto_title {
                 self.db.rename_tab(&id, &title);
                 self.load_tabs();
+            }
+            if learned > 0 {
+                self.last_learned = Some((Instant::now(), learned));
+                if self.show_memory {
+                    self.reload_memories();
+                }
             }
         }
 
@@ -593,6 +640,15 @@ impl eframe::App for ZedeApp {
                             .filter(|t| !t.is_empty());
                         let title = live_title.unwrap_or(tab.title);
                         ui.label(RichText::new(title).color(th.chrome.text).size(12.5));
+                    }
+                    if let Some((at, n)) = self.last_learned {
+                        if at.elapsed().as_secs() < 5 {
+                            ui.label(
+                                RichText::new(format!("✦ learned {n}"))
+                                    .color(th.chrome.green)
+                                    .size(11.0),
+                            );
+                        }
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.add_space(10.0);
