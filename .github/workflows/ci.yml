@@ -30,3 +30,7 @@ jobs:
       - run: pnpm test
       - run: pnpm run rebuild
       - run: xvfb-run -a pnpm selftest
+        env:
+          # GitHub runners don't ship Electron's SUID sandbox helper configured;
+          # the selftest needs no renderer sandbox.
+          ELECTRON_DISABLE_SANDBOX: "1"

@@ -1,0 +1,48 @@
+[package]
+name = "zede"
+version = "0.1.0"
+edition = "2021"
+description = "Zede — a Claude-first terminal. Native Rust rewrite."
+license = "MIT"
+repository = "https://github.com/goldinitp/zede"
+
+[dependencies]
+# x11/wayland are Linux-only inside winit; enabling them everywhere is how
+# eframe's own defaults work and costs nothing on macOS/Windows.
+eframe = { version = "0.32", default-features = false, features = ["wgpu", "default_fonts", "x11", "wayland"] }
+egui = "0.32"
+# eframe's slim feature set doesn't pick a wgpu backend; enable the native
+# ones here (each is cfg-gated to its platform inside wgpu, so this is safe
+# cross-platform).
+wgpu = { version = "25", default-features = false, features = ["metal", "vulkan", "dx12", "gles"] }
+alacritty_terminal = "0.25"
+portable-pty = "0.9"
+regex = "1"
+rusqlite = { version = "0.32", features = ["bundled"] }
+sha2 = "0.10"
+serde_json = "1"
+uuid = { version = "1", features = ["v4"] }
+dirs = "6"
+# `--screenshot` saves the composited frame; png-only keeps the dep small.
+image = { version = "0.25", default-features = false, features = ["png"] }
+# Validates system UI fonts (SF Pro / Helvetica Neue) before handing them to
+# egui — a bad face would otherwise panic at first layout. Same version egui
+# already vendors via ab_glyph.
+ttf-parser = "0.25"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+libproc = "0.14"
+
+# Terminal rendering in pure debug builds is sluggish; keep deps optimized.
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 2
+
+[profile.release]
+lto = "thin"
+strip = true
