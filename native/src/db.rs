@@ -451,6 +451,32 @@ impl Db {
         .unwrap_or_default()
     }
 
+    /// Every tab across every Space — the capture loop follows live sessions
+    /// even when their Space is not the active one.
+    pub fn list_all_tabs(&self) -> Vec<TabRow> {
+        let mut stmt = match self.conn.prepare(
+            "SELECT id, space_id, kind, title, cwd, pinned, sort_order, last_session_id
+             FROM tabs ORDER BY space_id, sort_order",
+        ) {
+            Ok(s) => s,
+            Err(_) => return Vec::new(),
+        };
+        stmt.query_map([], |r| {
+            Ok(TabRow {
+                id: r.get(0)?,
+                space_id: r.get(1)?,
+                kind: TabKind::from_str(&r.get::<_, String>(2)?),
+                title: r.get(3)?,
+                cwd: r.get(4)?,
+                pinned: r.get::<_, i64>(5)? != 0,
+                sort_order: r.get(6)?,
+                last_session_id: r.get(7)?,
+            })
+        })
+        .map(|rows| rows.filter_map(Result::ok).collect())
+        .unwrap_or_default()
+    }
+
     pub fn create_tab(&self, space_id: &str, kind: TabKind, title: &str, cwd: &str) -> TabRow {
         let id = Uuid::new_v4().to_string();
         let sort: i64 = self

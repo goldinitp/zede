@@ -102,8 +102,15 @@ fn check_db_tab_roundtrip() -> Result<(), String> {
         rows[0].last_session_id.as_deref() == Some("0f4bb1f8-0000-4000-8000-000000000000"),
         "last session persisted",
     )?;
+    let other = db.create_space("Other", None);
+    db.create_tab(&other.id, TabKind::Shell, "Bg", "/tmp");
+    expect(
+        db.list_all_tabs().len() == 2,
+        "list_all_tabs spans every space (background capture)",
+    )?;
     db.delete_space(&space.id);
     expect(db.list_tabs(&space.id).is_empty(), "cascade delete")?;
+    expect(db.list_all_tabs().len() == 1, "cascade reflected across spaces")?;
     let _ = std::fs::remove_dir_all(dir);
     Ok(())
 }

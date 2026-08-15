@@ -50,6 +50,10 @@ pub struct ZedeApp {
     extracted_upto: HashMap<String, usize>,
     /// Per-tab throttle for transcript discovery scans.
     discovery_at: HashMap<String, Instant>,
+    /// Cached all-Space tab rows for the capture loop (refreshed every ~2s so
+    /// background-Space sessions keep learning without per-frame db queries).
+    capture_tabs: Vec<TabRow>,
+    capture_tabs_at: Option<Instant>,
     last_learned: Option<(Instant, usize)>,
     learn_tx: std::sync::mpsc::Sender<extract::LearnRequest>,
     learn_rx: std::sync::mpsc::Receiver<extract::LearnResult>,
@@ -248,6 +252,8 @@ impl ZedeApp {
             import_report: None,
             extracted_upto: HashMap::new(),
             discovery_at: HashMap::new(),
+            capture_tabs: Vec::new(),
+            capture_tabs_at: None,
             last_learned: None,
             learn_tx,
             learn_rx,
@@ -270,6 +276,7 @@ impl ZedeApp {
     }
 
     fn load_tabs(&mut self) {
+        self.capture_tabs_at = None; // tab set changed — refresh capture view
         let mut tabs = self.db.list_tabs(&self.active_space);
         tabs.sort_by_key(|t| (!t.pinned, t.sort_order));
         self.tabs = tabs;
@@ -693,7 +700,15 @@ impl eframe::App for ZedeApp {
         {
             let mut auto_title: Option<(String, String)> = None;
             let mut rebinds: Vec<(String, std::path::PathBuf, String)> = Vec::new();
-            let tabs_snapshot = self.tabs.clone();
+            let stale = self
+                .capture_tabs_at
+                .map(|at| at.elapsed().as_secs() >= 2)
+                .unwrap_or(true);
+            if stale {
+                self.capture_tabs = self.db.list_all_tabs();
+                self.capture_tabs_at = Some(Instant::now());
+            }
+            let tabs_snapshot = self.capture_tabs.clone();
             for tab in &tabs_snapshot {
                 let Some(session) = self.sessions.get(&tab.id) else { continue };
                 if session.is_dead() {
