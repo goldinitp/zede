@@ -88,6 +88,13 @@ pub struct FullMemoryRow {
 }
 
 #[derive(Clone, Debug)]
+pub struct SupersedeCandidate {
+    pub id: String,
+    pub content: String,
+    pub source_hash: Option<String>,
+}
+
+#[derive(Clone, Debug)]
 pub struct TombstoneRow {
     pub fingerprint: String,
     pub scope: Option<String>,
@@ -849,6 +856,49 @@ impl Db {
         stmt.query_map([fingerprint], |r| Ok((r.get(0)?, r.get(1)?)))
             .map(|rows| rows.filter_map(Result::ok).collect())
             .unwrap_or_default()
+    }
+
+    /// Active same-space/scope/type rows for the supersede scan.
+    pub fn active_same_type(
+        &self,
+        space_id: Option<&str>,
+        mtype: &str,
+        scope: &str,
+        exclude_id: &str,
+    ) -> Vec<SupersedeCandidate> {
+        let Ok(mut stmt) = self.conn.prepare(
+            "SELECT id, content, source_hash FROM memories
+             WHERE status = 'active' AND type = ?1 AND scope = ?2 AND id != ?3
+               AND ((?4 IS NULL AND space_id IS NULL) OR space_id = ?4)",
+        ) else {
+            return Vec::new();
+        };
+        stmt.query_map(params![mtype, scope, exclude_id, space_id], |r| {
+            Ok(SupersedeCandidate {
+                id: r.get(0)?,
+                content: r.get(1)?,
+                source_hash: r.get(2)?,
+            })
+        })
+        .map(|rows| rows.filter_map(Result::ok).collect())
+        .unwrap_or_default()
+    }
+
+    pub fn set_memory_status(&self, id: &str, status: &str, now: i64) {
+        self.conn
+            .execute(
+                "UPDATE memories SET status = ?2, edited_at = ?3, updated_at = ?3 WHERE id = ?1",
+                params![id, status, now],
+            )
+            .ok();
+    }
+
+    pub fn get_memory_pinned(&self, id: &str) -> Option<bool> {
+        self.conn
+            .query_row("SELECT pinned FROM memories WHERE id = ?1", [id], |r| {
+                Ok(r.get::<_, i64>(0)? != 0)
+            })
+            .ok()
     }
 
     pub fn mark_tombstoned(&self, id: &str, now: i64) {

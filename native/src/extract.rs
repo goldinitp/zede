@@ -136,9 +136,14 @@ pub fn fingerprint(content: &str) -> String {
 }
 
 /// Store candidates with fingerprint dedupe against existing rows AND
-/// tombstones. UI thread only — the db has a single writer. Returns the
-/// number stored.
+/// tombstones, then supersede older near-duplicate opinions (hashing
+/// embedder cosine — the newer statement wins). UI thread only — the db has
+/// a single writer. Returns the number stored.
 pub fn store_candidates(db: &Db, space_id: &str, candidates: &[Candidate]) -> usize {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
     let mut stored = 0;
     for cand in candidates {
         let fp = fingerprint(&cand.content);
@@ -149,7 +154,11 @@ pub fn store_candidates(db: &Db, space_id: &str, candidates: &[Candidate]) -> us
             ScopeHint::Global => (None, "global"),
             ScopeHint::Space => (Some(space_id), "space"),
         };
-        db.insert_memory(space, scope, cand.mtype, &cand.content, Some(cand.confidence), Some(&fp));
+        let id =
+            db.insert_memory(space, scope, cand.mtype, &cand.content, Some(cand.confidence), Some(&fp));
+        crate::embed::supersede_near_duplicates(
+            db, &id, space, scope, cand.mtype, &cand.content, &fp, now,
+        );
         stored += 1;
     }
     stored
@@ -187,22 +196,26 @@ scope_hint \"global\" only for facts true across ALL projects (who the user is, 
 const CLAUDE_MODEL: &str = "claude-haiku-4-5-20251001";
 const CLAUDE_TIMEOUT: Duration = Duration::from_secs(60);
 
-/// Strict parsing of `claude -p --output-format json` stdout; bad extractor
-/// output must never reach the store. Handles the `structured_output` field,
-/// a JSON-string `result`, and an object `result`.
-pub fn parse_candidates(stdout: &str) -> Vec<Candidate> {
-    let Ok(envelope) = serde_json::from_str::<serde_json::Value>(stdout) else {
-        return Vec::new();
-    };
-    let mut payload = envelope.get("structured_output").cloned();
-    if payload.is_none() || payload == Some(serde_json::Value::Null) {
-        payload = match envelope.get("result") {
+/// Unwrap the structured payload from `claude -p --output-format json`
+/// stdout: the `structured_output` field, a JSON-string `result`, or an
+/// object `result`.
+pub fn envelope_payload(stdout: &str) -> Option<serde_json::Value> {
+    let envelope = serde_json::from_str::<serde_json::Value>(stdout).ok()?;
+    let payload = envelope.get("structured_output").cloned();
+    match payload {
+        Some(v) if !v.is_null() => Some(v),
+        _ => match envelope.get("result") {
             Some(serde_json::Value::String(s)) => serde_json::from_str(s).ok(),
             Some(v @ serde_json::Value::Object(_)) => Some(v.clone()),
             _ => None,
-        };
+        },
     }
-    let Some(payload) = payload else { return Vec::new() };
+}
+
+/// Strict parsing of extractor output; bad extractor output must never reach
+/// the store.
+pub fn parse_candidates(stdout: &str) -> Vec<Candidate> {
+    let Some(payload) = envelope_payload(stdout) else { return Vec::new() };
     let list = payload
         .get("memories")
         .and_then(|m| m.as_array())
@@ -257,26 +270,22 @@ pub fn is_internal_session(id: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// Run `claude -p` over a redacted span. Blocking (called from the worker
-/// thread). `None` = claude could not be run at all (caller may fall back);
-/// `Some(vec)` = it ran, possibly finding nothing.
+/// Run one schema-constrained `claude -p` call. Blocking. `None` = claude
+/// could not be run at all; `Some(stdout)` = it ran.
 ///
 /// The child claude writes its own transcript under the temp dir's cwd slug —
 /// never a watched project directory — and its session id is registered as
 /// internal, so discovery can't re-distill extractor output.
-pub fn claude_extract(span: &str) -> Option<Vec<Candidate>> {
-    if span.trim().is_empty() {
-        return Some(Vec::new());
-    }
+pub fn claude_call(prompt: &str, system: &str, schema: &str) -> Option<String> {
     let session_id = uuid::Uuid::new_v4().to_string();
     mark_internal_session(&session_id);
     let mut child = std::process::Command::new("claude")
         .args([
-            "-p", span,
+            "-p", prompt,
             "--session-id", &session_id,
             "--output-format", "json",
-            "--json-schema", SCHEMA,
-            "--append-system-prompt", SYSTEM,
+            "--json-schema", schema,
+            "--append-system-prompt", system,
             "--model", CLAUDE_MODEL,
         ])
         .current_dir(std::env::temp_dir())
@@ -309,8 +318,16 @@ pub fn claude_extract(span: &str) -> Option<Vec<Candidate>> {
             Err(_) => break,
         }
     }
-    let out = reader.join().unwrap_or_default();
-    Some(parse_candidates(&out))
+    Some(reader.join().unwrap_or_default())
+}
+
+/// Extractor tier over one span. `None` = claude unavailable (caller may
+/// fall back); `Some(vec)` = it ran, possibly finding nothing.
+pub fn claude_extract(span: &str) -> Option<Vec<Candidate>> {
+    if span.trim().is_empty() {
+        return Some(Vec::new());
+    }
+    claude_call(span, SYSTEM, SCHEMA).map(|out| parse_candidates(&out))
 }
 
 // --- async extraction worker -------------------------------------------------

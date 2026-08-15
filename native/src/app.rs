@@ -309,9 +309,16 @@ impl ZedeApp {
             MemoryAction::Import => {
                 match self.db.import_from_electron(&electron_db_path()) {
                     Ok(r) => {
+                        // Imported opinion sets are full of restatements —
+                        // collapse near-duplicates right away.
+                        let now = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_millis() as i64)
+                            .unwrap_or(0);
+                        let deduped = crate::embed::dedupe_pass(&self.db, now);
                         self.import_report = Some(format!(
-                            "Imported {} memories, {} spaces, {} tombstones ({} skipped)",
-                            r.memories, r.spaces, r.tombstones, r.skipped
+                            "Imported {} memories, {} spaces, {} tombstones ({} skipped, {} near-duplicates collapsed)",
+                            r.memories, r.spaces, r.tombstones, r.skipped, deduped
                         ));
                         self.spaces = self.db.list_spaces();
                         self.reload_memories();

@@ -777,6 +777,147 @@ fn check_ranker_fts_term() -> Result<(), String> {
     Ok(())
 }
 
+fn check_hashing_embedder() -> Result<(), String> {
+    use crate::embed::{cosine, embed, SUPERSEDE_THRESHOLD};
+    let a1 = embed("the app is named zede, never claudelens");
+    let a2 = embed("App is named zede, not claudelens — use zede consistently.");
+    let b = embed("terminal scrollback buffer defaults to one thousand lines");
+    expect(embed("same text") == embed("same text"), "deterministic")?;
+    expect((cosine(&a1, &a1) - 1.0).abs() < 1e-5, "self-similarity is 1")?;
+    let near = cosine(&a1, &a2);
+    let far = cosine(&a1, &b);
+    expect(near > far, "restatements score above unrelated text")?;
+    expect(
+        near >= SUPERSEDE_THRESHOLD && far < SUPERSEDE_THRESHOLD,
+        &format!("threshold separates them (near={near:.2}, far={far:.2})"),
+    )?;
+    Ok(())
+}
+
+fn check_supersede_on_insert() -> Result<(), String> {
+    use crate::extract::{store_candidates, Candidate, ScopeHint};
+    let (db, dir) = temp_db()?;
+    let space = db.create_space("Sup", None);
+    let cand = |content: &str, mtype: &'static str| Candidate {
+        mtype,
+        content: content.into(),
+        confidence: 0.6,
+        scope_hint: ScopeHint::Space,
+    };
+    store_candidates(&db, &space.id, &[cand("Always use pnpm for package management.", "preference")]);
+    std::thread::sleep(Duration::from_millis(5));
+    store_candidates(&db, &space.id, &[cand("Use pnpm for all package management, always.", "preference")]);
+    let rows = db.list_memories(&space.id);
+    expect(rows.len() == 1, "older restatement superseded — one active opinion")?;
+    expect(
+        rows[0].content.starts_with("Use pnpm for all"),
+        "the newer statement wins",
+    )?;
+
+    // Facts accumulate — no superseding.
+    store_candidates(&db, &space.id, &[cand("The db is at path one.", "fact")]);
+    store_candidates(&db, &space.id, &[cand("The db is at path one, truly.", "fact")]);
+    let facts = db
+        .list_memories(&space.id)
+        .into_iter()
+        .filter(|m| m.mtype == "fact")
+        .count();
+    expect(facts == 2, "facts accumulate; only opinions supersede")?;
+    let _ = std::fs::remove_dir_all(dir);
+    Ok(())
+}
+
+fn check_dedupe_pass() -> Result<(), String> {
+    let (db, dir) = temp_db()?;
+    let space = db.create_space("Dd", None);
+    let a = db.insert_memory(Some(&space.id), "space", "preference",
+        "the app is named zede, never claudelens", None, Some("d1"));
+    let b = db.insert_memory(Some(&space.id), "space", "preference",
+        "App is named zede, not claudelens — use zede everywhere.", None, Some("d2"));
+    let _c = db.insert_memory(Some(&space.id), "space", "preference",
+        "Line spacing defaults to one point zero for tight terminals.", None, Some("d3"));
+    // Pin the OLDER duplicate — pinned rows must win over newer ones.
+    db.set_memory_pinned(&a, true);
+    let collapsed = crate::embed::dedupe_pass(&db, 999_999);
+    expect(collapsed == 1, "one near-duplicate collapsed")?;
+    let rows = db.list_memories(&space.id);
+    expect(rows.len() == 2, "two distinct opinions remain")?;
+    expect(
+        rows.iter().any(|m| m.id == a) && !rows.iter().any(|m| m.id == b),
+        "the pinned duplicate wins even though it is older",
+    )?;
+    let again = crate::embed::dedupe_pass(&db, 999_999);
+    expect(again == 0, "idempotent")?;
+    let _ = std::fs::remove_dir_all(dir);
+    Ok(())
+}
+
+fn check_dedupe_cluster_application() -> Result<(), String> {
+    use crate::embed::apply_dedupe_clusters;
+    let (db, dir) = temp_db()?;
+    let space = db.create_space("Llm", None);
+    let a = db.insert_memory(Some(&space.id), "space", "preference", "rule stated one way", None, Some("x1"));
+    let b = db.insert_memory(Some(&space.id), "space", "preference", "rule stated another way", None, Some("x2"));
+    let c = db.insert_memory(Some(&space.id), "space", "preference", "a different rule entirely", None, Some("x3"));
+    db.set_memory_pinned(&b, true);
+
+    // Keys the model saw map to JudgeRows — use k1/k2/k3 here.
+    let jr = |id: &str, pinned: bool, content: &str| crate::embed::JudgeRow {
+        id: id.to_string(),
+        pinned,
+        content: content.to_string(),
+    };
+    let group: std::collections::HashMap<String, crate::embed::JudgeRow> = [
+        ("k1".to_string(), jr(&a, false, "rule stated one way")),
+        ("k2".to_string(), jr(&b, true, "rule stated another way")),
+        ("k3".to_string(), jr(&c, false, "a different rule entirely")),
+    ]
+    .into_iter()
+    .collect();
+
+    // Model proposes keeping the unpinned duplicate and dropping the pinned
+    // one — the pinned row must be promoted to keeper instead.
+    let payload = serde_json::json!({"clusters": [{"keep": "k1", "drop": ["k2"]}]});
+    let n = apply_dedupe_clusters(&db, &group, &payload, 999);
+    expect(n == 1, "one row superseded")?;
+    let rows = db.list_memories(&space.id);
+    expect(
+        rows.iter().any(|m| m.id == b) && !rows.iter().any(|m| m.id == a),
+        "pinned row promoted to keeper; unpinned duplicate dropped",
+    )?;
+
+    // Hallucinated keys reject the whole cluster; keys outside the group are
+    // filtered; keep==drop is ignored.
+    let payload = serde_json::json!({"clusters": [
+        {"keep": "not-a-real-key", "drop": ["k3"]},
+        {"keep": "k3", "drop": ["k3", "ghost-key"]}
+    ]});
+    let n = apply_dedupe_clusters(&db, &group, &payload, 999);
+    expect(n == 0, "hallucinated / self-referential clusters change nothing")?;
+    expect(db.list_memories(&space.id).len() == 2, "survivors intact")?;
+
+    // The judge often echoes content instead of keys — verbatim echoes must
+    // resolve; a lexically unrelated drop must be refused (similarity floor).
+    let d = db.insert_memory(Some(&space.id), "space", "preference", "rule stated a third way", None, Some("x4"));
+    let mut group2 = std::collections::HashMap::new();
+    group2.insert("k2".to_string(), jr(&b, true, "rule stated another way"));
+    group2.insert("k3".to_string(), jr(&c, false, "a different rule entirely"));
+    group2.insert("k4".to_string(), jr(&d, false, "rule stated a third way"));
+    let payload = serde_json::json!({"clusters": [{
+        "keep": "rule stated another way",
+        "drop": ["rule stated a third way", "a different rule entirely"]
+    }]});
+    let n = apply_dedupe_clusters(&db, &group2, &payload, 999);
+    expect(n == 1, "content echo resolves; unrelated drop refused by the floor")?;
+    let rows = db.list_memories(&space.id);
+    expect(
+        rows.iter().any(|m| m.id == c) && !rows.iter().any(|m| m.id == d),
+        "similar restatement dropped; the different rule survives",
+    )?;
+    let _ = std::fs::remove_dir_all(dir);
+    Ok(())
+}
+
 fn check_process_cwd() -> Result<(), String> {
     if cfg!(any(target_os = "macos", target_os = "linux")) {
         let me = std::process::id() as i32;
@@ -1142,6 +1283,10 @@ pub fn run() -> i32 {
         ("ranker lexical term", check_ranker_fts_term),
         ("live process cwd", check_process_cwd),
         ("transcript discovery", check_transcript_discovery),
+        ("hashing embedder", check_hashing_embedder),
+        ("supersede on insert", check_supersede_on_insert),
+        ("dedupe pass", check_dedupe_pass),
+        ("llm dedupe cluster application", check_dedupe_cluster_application),
         ("sync format roundtrip", check_sync_format_roundtrip),
         ("sync export determinism + redaction", check_sync_export),
         ("sync merge rules", check_sync_merge_rules),

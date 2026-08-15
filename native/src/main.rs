@@ -3,6 +3,7 @@
 mod app;
 mod capture;
 mod db;
+mod embed;
 mod extract;
 mod inject;
 mod pty;
@@ -38,6 +39,30 @@ fn main() {
             }
             Err(e) => {
                 eprintln!("import failed: {e}");
+                std::process::exit(1);
+            }
+        }
+    }
+
+    if args.iter().any(|a| a == "--dedupe") {
+        match app::open_db() {
+            Ok(db) => {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as i64)
+                    .unwrap_or(0);
+                let fast = embed::dedupe_pass(&db, now);
+                println!("hashing tier: collapsed {fast} near-verbatim opinions");
+                match embed::llm_dedupe(&db, now) {
+                    Ok((n, groups)) => {
+                        println!("claude tier: collapsed {n} restatements across {groups} groups")
+                    }
+                    Err(e) => println!("claude tier skipped: {e}"),
+                }
+                return;
+            }
+            Err(e) => {
+                eprintln!("dedupe failed: {e}");
                 std::process::exit(1);
             }
         }
