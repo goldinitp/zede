@@ -10,11 +10,12 @@ use alacritty_terminal::vte::ansi::{CursorShape as AnsiCursorShape, CursorStyle 
 use egui::{Align2, Color32, CornerRadius, Frame, Key, Modifiers, RichText, Vec2};
 
 use crate::capture::PromptFeed;
-use crate::db::{Db, SpaceRow, TabRow};
+use crate::db::{Db, MemoryRow, SpaceRow, TabRow};
 use crate::pty::{self, TabKind};
 use crate::settings::{self, CursorStyleKind, Settings};
 use crate::term::{OscColors, TermSession};
 use crate::theme::{self, AppTheme};
+use crate::ui::memory::{self, MemoryAction};
 use crate::ui::sidebar::{self, Action, SidebarState, TabLive};
 use crate::ui::{settings_panel, terminal};
 
@@ -35,7 +36,24 @@ pub struct ZedeApp {
     sidebar_state: SidebarState,
     sidebar_visible: bool,
     show_settings: bool,
+    show_memory: bool,
+    memory_rows: Vec<MemoryRow>,
+    memory_filter: String,
+    electron_db_available: bool,
+    import_report: Option<String>,
     focus_terminal: bool,
+}
+
+pub fn electron_db_path() -> PathBuf {
+    dirs::data_dir()
+        .unwrap_or_else(|| dirs::home_dir().unwrap_or_else(|| PathBuf::from(".")))
+        .join("Zede")
+        .join("zede.db")
+}
+
+/// Open (and migrate) the native database at its resolved location.
+pub fn open_db() -> Result<Db, String> {
+    Db::open(&db_path())
 }
 
 fn db_path() -> PathBuf {
@@ -161,6 +179,11 @@ impl ZedeApp {
             sidebar_state: SidebarState::default(),
             sidebar_visible: true,
             show_settings: false,
+            show_memory: false,
+            memory_rows: Vec::new(),
+            memory_filter: String::new(),
+            electron_db_available: electron_db_path().exists(),
+            import_report: None,
             focus_terminal: true,
         };
         app.load_tabs();
@@ -180,6 +203,37 @@ impl ZedeApp {
             self.active_tab.insert(self.active_space.clone(), id);
         } else {
             self.active_tab.remove(&self.active_space);
+        }
+    }
+
+    fn reload_memories(&mut self) {
+        self.memory_rows = self.db.list_memories(&self.active_space);
+    }
+
+    fn handle_memory_action(&mut self, action: MemoryAction) {
+        match action {
+            MemoryAction::SetPinned(id, pinned) => {
+                self.db.set_memory_pinned(&id, pinned);
+                self.reload_memories();
+            }
+            MemoryAction::Forget(id) => {
+                self.db.forget_memory(&id, "forgotten from memory panel");
+                self.reload_memories();
+            }
+            MemoryAction::Import => {
+                match self.db.import_from_electron(&electron_db_path()) {
+                    Ok(r) => {
+                        self.import_report = Some(format!(
+                            "Imported {} memories, {} spaces, {} tombstones ({} skipped)",
+                            r.memories, r.spaces, r.tombstones, r.skipped
+                        ));
+                        self.spaces = self.db.list_spaces();
+                        self.reload_memories();
+                    }
+                    Err(e) => self.import_report = Some(format!("Import failed: {e}")),
+                }
+            }
+            MemoryAction::ClearReport => self.import_report = None,
         }
     }
 
@@ -253,6 +307,9 @@ impl ZedeApp {
                 self.active_space = id;
                 self.db.meta_set("active_space", &self.active_space);
                 self.load_tabs();
+                if self.show_memory {
+                    self.reload_memories();
+                }
                 self.focus_terminal = true;
             }
             Action::NewSpace => {
@@ -335,6 +392,7 @@ impl ZedeApp {
         let mut actions: Vec<Action> = Vec::new();
         let mut toggle_settings = false;
         let mut toggle_sidebar = false;
+        let mut toggle_memory = false;
         let mut clear_terminal = false;
         let mut select_index: Option<usize> = None;
         let mut cycle: i32 = 0;
@@ -355,6 +413,9 @@ impl ZedeApp {
             }
             if i.consume_key(cmd, Key::S) {
                 toggle_sidebar = true;
+            }
+            if i.consume_key(cmd, Key::M) {
+                toggle_memory = true;
             }
             if i.consume_key(cmd, Key::K) {
                 clear_terminal = true;
@@ -381,6 +442,12 @@ impl ZedeApp {
         }
         if toggle_sidebar {
             self.sidebar_visible = !self.sidebar_visible;
+        }
+        if toggle_memory {
+            self.show_memory = !self.show_memory;
+            if self.show_memory {
+                self.reload_memories();
+            }
         }
         if clear_terminal {
             if let Some(tab) = self.current_tab() {
@@ -597,6 +664,32 @@ impl eframe::App for ZedeApp {
                             pending.push(a);
                         }
                     });
+            }
+        }
+
+        // --- memory sidebar (⌘M) ---------------------------------------------
+        if self.show_memory {
+            let mut mem_action = None;
+            let rows = &self.memory_rows;
+            let filter = &mut self.memory_filter;
+            let electron_available = self.electron_db_available;
+            let report = self.import_report.clone();
+            egui::SidePanel::right("memory")
+                .default_width(280.0)
+                .width_range(220.0..=420.0)
+                .frame(Frame::NONE.fill(th.chrome.chrome))
+                .show(ctx, |ui| {
+                    mem_action = memory::memory_panel(
+                        ui,
+                        rows,
+                        filter,
+                        electron_available,
+                        report.as_deref(),
+                        th,
+                    );
+                });
+            if let Some(a) = mem_action {
+                self.handle_memory_action(a);
             }
         }
 

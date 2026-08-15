@@ -15,6 +15,7 @@ egui = "0.32"
 wgpu = { version = "25", default-features = false, features = ["metal", "vulkan", "dx12", "gles"] }
 alacritty_terminal = "0.25"
 portable-pty = "0.9"
+regex = "1"
 rusqlite = { version = "0.32", features = ["bundled"] }
 serde_json = "1"
 uuid = { version = "1", features = ["v4"] }

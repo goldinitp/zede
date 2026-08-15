@@ -25,6 +25,27 @@ pub struct SpaceRow {
 }
 
 #[derive(Clone, Debug)]
+pub struct MemoryRow {
+    pub id: String,
+    #[allow(dead_code)] // space badge in detail view (P6 continuation)
+    pub space_id: Option<String>,
+    pub scope: String,
+    pub mtype: String,
+    pub content: String,
+    pub pinned: bool,
+    #[allow(dead_code)] // shown in detail view (P6 continuation)
+    pub created_at: Option<i64>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ImportReport {
+    pub spaces: usize,
+    pub memories: usize,
+    pub tombstones: usize,
+    pub skipped: usize,
+}
+
+#[derive(Clone, Debug)]
 pub struct TabRow {
     pub id: String,
     #[allow(dead_code)] // used by tab move/duplicate (P5)
@@ -44,6 +65,8 @@ fn now_ms() -> i64 {
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0)
 }
+
+const LATEST_VERSION: i64 = 2;
 
 const SCHEMA_V1: &str = "
 CREATE TABLE IF NOT EXISTS meta (
@@ -76,6 +99,28 @@ CREATE TABLE IF NOT EXISTS tabs (
 CREATE INDEX IF NOT EXISTS idx_tabs_space ON tabs(space_id, sort_order);
 ";
 
+// Memory layer, column-compatible with the Electron app's `memories` and
+// `tombstones` tables (schema v6 shape) so import is 1:1 and future sync
+// round-trips. Tombstones are append-only; never destructively migrated.
+const SCHEMA_V2: &str = "
+CREATE TABLE IF NOT EXISTS memories (
+  id TEXT PRIMARY KEY,
+  space_id TEXT, scope TEXT NOT NULL,
+  type TEXT NOT NULL, content TEXT NOT NULL,
+  confidence REAL, salience REAL,
+  status TEXT NOT NULL, pinned INTEGER NOT NULL DEFAULT 0, use_count INTEGER NOT NULL DEFAULT 0,
+  source_hash TEXT,
+  created_at INTEGER, updated_at INTEGER, edited_at INTEGER, last_used_at INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_memories_space_status ON memories(space_id, status);
+CREATE TABLE IF NOT EXISTS tombstones (
+  id TEXT PRIMARY KEY, fingerprint TEXT NOT NULL,
+  scope TEXT, space_id TEXT, reason TEXT,
+  created_at INTEGER, created_by TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_tombstones_fingerprint ON tombstones(fingerprint);
+";
+
 impl Db {
     pub fn open(path: &Path) -> Result<Db, String> {
         if let Some(parent) = path.parent() {
@@ -90,37 +135,45 @@ impl Db {
     }
 
     fn migrate(&self) -> Result<(), String> {
-        const SCHEMA_VERSION: i64 = 1;
         let version: i64 = self
             .conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .map_err(|e| e.to_string())?;
         // Never touch a database we don't own (e.g. the Electron app's db,
-        // which is at schema version 6+). Refusing beats silent misbehavior.
-        if version > SCHEMA_VERSION {
+        // which is at schema version 6+ with different tables). Refusing
+        // beats silent misbehavior. The table check below closes the gap for
+        // files that happen to share a low version number.
+        if version > LATEST_VERSION {
             return Err(format!(
-                "database has schema version {version} (ours is {SCHEMA_VERSION}) — \
+                "database has schema version {version} (ours is {LATEST_VERSION}) — \
                  this looks like another app's file; refusing to modify it"
             ));
         }
-        if version < 1 {
-            self.conn.execute_batch(SCHEMA_V1).map_err(|e| e.to_string())?;
-            self.conn
-                .pragma_update(None, "user_version", 1)
-                .map_err(|e| e.to_string())?;
+        if version >= 1 && !self.has_table("spaces").unwrap_or(false) {
+            return Err("database is missing zede tables — not a zede-native db".to_string());
         }
-        let has_spaces: i64 = self
+        let steps: &[(i64, &str)] = &[(1, SCHEMA_V1), (2, SCHEMA_V2)];
+        for (v, sql) in steps {
+            if version < *v {
+                self.conn.execute_batch(sql).map_err(|e| e.to_string())?;
+                self.conn
+                    .pragma_update(None, "user_version", *v)
+                    .map_err(|e| e.to_string())?;
+            }
+        }
+        Ok(())
+    }
+
+    fn has_table(&self, name: &str) -> Result<bool, String> {
+        let n: i64 = self
             .conn
             .query_row(
-                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='spaces'",
-                [],
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
+                [name],
                 |r| r.get(0),
             )
             .map_err(|e| e.to_string())?;
-        if has_spaces == 0 {
-            return Err("database is missing zede tables — not a zede-native db".to_string());
-        }
-        Ok(())
+        Ok(n > 0)
     }
 
     // --- settings / meta ---------------------------------------------------
@@ -299,6 +352,253 @@ impl Db {
                 params![id, session_id],
             )
             .ok();
+    }
+
+    // --- memories -----------------------------------------------------------
+
+    /// Active memories visible to a Space (its own + global rows), pinned
+    /// first, most recently edited first. Capped like the Electron sidebar.
+    pub fn list_memories(&self, space_id: &str) -> Vec<MemoryRow> {
+        let mut stmt = match self.conn.prepare(
+            "SELECT id, space_id, scope, type, content, pinned, created_at
+             FROM memories
+             WHERE (space_id = ?1 OR space_id IS NULL) AND status = 'active'
+             ORDER BY pinned DESC, COALESCE(edited_at, updated_at, created_at) DESC
+             LIMIT 500",
+        ) {
+            Ok(s) => s,
+            Err(_) => return Vec::new(),
+        };
+        stmt.query_map([space_id], |r| {
+            Ok(MemoryRow {
+                id: r.get(0)?,
+                space_id: r.get(1)?,
+                scope: r.get(2)?,
+                mtype: r.get(3)?,
+                content: r.get(4)?,
+                pinned: r.get::<_, i64>(5)? != 0,
+                created_at: r.get(6)?,
+            })
+        })
+        .map(|rows| rows.filter_map(Result::ok).collect())
+        .unwrap_or_default()
+    }
+
+    pub fn insert_memory(
+        &self,
+        space_id: Option<&str>,
+        scope: &str,
+        mtype: &str,
+        content: &str,
+    ) -> String {
+        let id = Uuid::new_v4().to_string();
+        let now = now_ms();
+        self.conn
+            .execute(
+                "INSERT INTO memories(id, space_id, scope, type, content, status, pinned,
+                                      use_count, created_at, updated_at, edited_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, 'active', 0, 0, ?6, ?6, ?6)",
+                params![id, space_id, scope, mtype, content, now],
+            )
+            .ok();
+        id
+    }
+
+    pub fn set_memory_pinned(&self, id: &str, pinned: bool) {
+        self.conn
+            .execute(
+                "UPDATE memories SET pinned = ?2, edited_at = ?3 WHERE id = ?1",
+                params![id, pinned as i64, now_ms()],
+            )
+            .ok();
+    }
+
+    /// Soft delete: status -> tombstoned plus an append-only tombstone row so
+    /// the memory can never silently return (via sync, re-import or
+    /// re-extraction).
+    pub fn forget_memory(&self, id: &str, reason: &str) {
+        let row: Option<(Option<String>, String, Option<String>)> = self
+            .conn
+            .query_row(
+                "SELECT space_id, scope, source_hash FROM memories WHERE id = ?1",
+                [id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .ok();
+        let Some((space_id, scope, source_hash)) = row else { return };
+        let now = now_ms();
+        self.conn
+            .execute(
+                "UPDATE memories SET status = 'tombstoned', edited_at = ?2 WHERE id = ?1",
+                params![id, now],
+            )
+            .ok();
+        let fingerprint = source_hash.unwrap_or_else(|| id.to_string());
+        self.conn
+            .execute(
+                "INSERT INTO tombstones(id, fingerprint, scope, space_id, reason, created_at, created_by)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'native')",
+                params![Uuid::new_v4().to_string(), fingerprint, scope, space_id, reason, now],
+            )
+            .ok();
+    }
+
+    pub fn tombstone_count(&self) -> i64 {
+        self.conn
+            .query_row("SELECT COUNT(*) FROM tombstones", [], |r| r.get(0))
+            .unwrap_or(0)
+    }
+
+    // --- Electron import ----------------------------------------------------
+
+    /// One-way, read-only import from the Electron app's database (schema v6+):
+    /// spaces, non-tombstoned memories, and the tombstone ledger. Idempotent —
+    /// everything inserts by original id with OR IGNORE.
+    pub fn import_from_electron(&self, source: &Path) -> Result<ImportReport, String> {
+        let src = Connection::open_with_flags(
+            source,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .map_err(|e| format!("open {}: {e}", source.display()))?;
+
+        let src_version: i64 = src
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .map_err(|e| e.to_string())?;
+        if src_version < 6 {
+            return Err(format!(
+                "Electron db is schema v{src_version}; run the Electron app once to upgrade it to v6+"
+            ));
+        }
+
+        let mut report = ImportReport::default();
+        self.conn.execute_batch("BEGIN").map_err(|e| e.to_string())?;
+        let result = (|| -> Result<(), String> {
+            // Spaces first so imported memories keep their space grouping.
+            let mut stmt = src
+                .prepare("SELECT id, name, icon, COALESCE(sort_order, 0), COALESCE(created_at, 0) FROM spaces")
+                .map_err(|e| e.to_string())?;
+            let rows = stmt
+                .query_map([], |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, Option<String>>(2)?,
+                        r.get::<_, i64>(3)?,
+                        r.get::<_, i64>(4)?,
+                    ))
+                })
+                .map_err(|e| e.to_string())?;
+            for row in rows.filter_map(Result::ok) {
+                let (id, name, icon, sort, created) = row;
+                let n = self
+                    .conn
+                    .execute(
+                        "INSERT OR IGNORE INTO spaces(id, name, icon, sort_order, is_default, created_at)
+                         VALUES (?1, ?2, ?3, ?4, 0, ?5)",
+                        params![id, name, icon, sort + 100, created],
+                    )
+                    .map_err(|e| e.to_string())?;
+                report.spaces += n;
+            }
+
+            let mut stmt = src
+                .prepare(
+                    "SELECT id, space_id, scope, type, content, confidence, salience, status,
+                            COALESCE(pinned, 0), COALESCE(use_count, 0), source_hash,
+                            created_at, updated_at, edited_at, last_used_at
+                     FROM memories",
+                )
+                .map_err(|e| e.to_string())?;
+            let rows = stmt
+                .query_map([], |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, Option<String>>(1)?,
+                        r.get::<_, String>(2)?,
+                        r.get::<_, String>(3)?,
+                        r.get::<_, String>(4)?,
+                        r.get::<_, Option<f64>>(5)?,
+                        r.get::<_, Option<f64>>(6)?,
+                        r.get::<_, String>(7)?,
+                        r.get::<_, i64>(8)?,
+                        r.get::<_, i64>(9)?,
+                        r.get::<_, Option<String>>(10)?,
+                        r.get::<_, Option<i64>>(11)?,
+                        r.get::<_, Option<i64>>(12)?,
+                        r.get::<_, Option<i64>>(13)?,
+                        r.get::<_, Option<i64>>(14)?,
+                    ))
+                })
+                .map_err(|e| e.to_string())?;
+            for row in rows.filter_map(Result::ok) {
+                let (id, space_id, scope, mtype, content, confidence, salience, status,
+                     pinned, use_count, source_hash, created, updated, edited, last_used) = row;
+                if status == "tombstoned" {
+                    report.skipped += 1;
+                    continue;
+                }
+                let n = self
+                    .conn
+                    .execute(
+                        "INSERT OR IGNORE INTO memories(id, space_id, scope, type, content,
+                             confidence, salience, status, pinned, use_count, source_hash,
+                             created_at, updated_at, edited_at, last_used_at)
+                         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)",
+                        params![id, space_id, scope, mtype, content, confidence, salience,
+                                status, pinned, use_count, source_hash, created, updated,
+                                edited, last_used],
+                    )
+                    .map_err(|e| e.to_string())?;
+                if n == 0 {
+                    report.skipped += 1;
+                } else {
+                    report.memories += n;
+                }
+            }
+
+            let mut stmt = src
+                .prepare(
+                    "SELECT id, fingerprint, scope, space_id, reason, created_at, created_by
+                     FROM tombstones",
+                )
+                .map_err(|e| e.to_string())?;
+            let rows = stmt
+                .query_map([], |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, Option<String>>(2)?,
+                        r.get::<_, Option<String>>(3)?,
+                        r.get::<_, Option<String>>(4)?,
+                        r.get::<_, Option<i64>>(5)?,
+                        r.get::<_, Option<String>>(6)?,
+                    ))
+                })
+                .map_err(|e| e.to_string())?;
+            for row in rows.filter_map(Result::ok) {
+                let (id, fp, scope, space_id, reason, created, by) = row;
+                let n = self
+                    .conn
+                    .execute(
+                        "INSERT OR IGNORE INTO tombstones(id, fingerprint, scope, space_id, reason, created_at, created_by)
+                         VALUES (?1,?2,?3,?4,?5,?6,?7)",
+                        params![id, fp, scope, space_id, reason, created, by],
+                    )
+                    .map_err(|e| e.to_string())?;
+                report.tombstones += n;
+            }
+            Ok(())
+        })();
+        match result {
+            Ok(()) => {
+                self.conn.execute_batch("COMMIT").map_err(|e| e.to_string())?;
+                Ok(report)
+            }
+            Err(e) => {
+                let _ = self.conn.execute_batch("ROLLBACK");
+                Err(e)
+            }
+        }
     }
 
     /// First run: one Space with one claude tab in the user's home directory.

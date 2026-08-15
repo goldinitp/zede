@@ -3557,6 +3557,7 @@ dependencies = [
  "libc",
  "libproc",
  "portable-pty",
+ "regex",
  "rusqlite",
  "serde_json",
  "uuid",

@@ -10,6 +10,7 @@ use egui::Color32;
 use crate::app::osc_from_theme;
 use crate::capture::{prompt_from_line, PromptFeed};
 use crate::db::Db;
+use crate::redact::redact;
 use crate::pty::{self, TabKind};
 use crate::settings::{normalize_setting_value, Settings};
 use crate::term::TermSession;
@@ -369,6 +370,120 @@ fn check_prompt_feed_incremental() -> Result<(), String> {
     Ok(())
 }
 
+fn check_redaction() -> Result<(), String> {
+    let r = redact("key is sk-ant-abc123def456ghi789jkl012 ok");
+    expect(
+        r.text == "key is [REDACTED:anthropic-key] ok" && r.redactions == 1,
+        "anthropic key redacted",
+    )?;
+    let r = redact("AKIAIOSFODNN7EXAMPLE");
+    expect(r.text.contains("[REDACTED:aws-akid]"), "aws access key id redacted")?;
+    let r = redact("-----BEGIN RSA PRIVATE KEY-----\nMII...x\n-----END RSA PRIVATE KEY-----");
+    expect(r.text == "[REDACTED:private-key]", "private key block redacted")?;
+    let r = redact("password: hunter2-super-secret");
+    expect(r.text.starts_with("[REDACTED:secret-kv]"), "password kv redacted")?;
+    let r = redact("token aB3xK9mQ7rT2wY5zN8cV1bH4jL6pD0fG");
+    expect(
+        r.text.contains("[REDACTED:high-entropy]"),
+        "high-entropy opaque token redacted",
+    )?;
+    let path = "/Users/goldi/Documents/code/zede/native/src/some/deep/path/file.rs";
+    let r = redact(path);
+    expect(r.text == path && r.redactions == 0, "filesystem paths untouched")?;
+    let r = redact("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+    expect(r.redactions == 0, "low-entropy long token untouched")?;
+    let plain = "we decided to use pnpm for this repo";
+    let r = redact(plain);
+    expect(r.text == plain, "ordinary prose untouched")?;
+    Ok(())
+}
+
+fn check_memory_crud() -> Result<(), String> {
+    let (db, dir) = temp_db()?;
+    let space = db.create_space("Mem", None);
+    let a = db.insert_memory(Some(&space.id), "space", "fact", "space-scoped fact");
+    let _b = db.insert_memory(None, "global", "decision", "global decision");
+    let other = db.create_space("Other", None);
+    let _c = db.insert_memory(Some(&other.id), "space", "fact", "other space fact");
+
+    let rows = db.list_memories(&space.id);
+    expect(rows.len() == 2, "space sees own + global rows")?;
+    db.set_memory_pinned(&a, true);
+    let rows = db.list_memories(&space.id);
+    expect(rows[0].id == a && rows[0].pinned, "pinned rows sort first")?;
+
+    db.forget_memory(&a, "test");
+    let rows = db.list_memories(&space.id);
+    expect(rows.len() == 1, "forgotten memory leaves the list")?;
+    expect(db.tombstone_count() == 1, "forget writes a tombstone")?;
+    let _ = std::fs::remove_dir_all(dir);
+    Ok(())
+}
+
+fn check_electron_import() -> Result<(), String> {
+    let dir = std::env::temp_dir().join(format!("zede-selftest-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+
+    // Fixture mimicking the Electron schema-v6 tables the importer touches.
+    let src_path = dir.join("electron.db");
+    {
+        let src = rusqlite::Connection::open(&src_path).map_err(|e| e.to_string())?;
+        src.execute_batch(
+            "CREATE TABLE spaces (id TEXT PRIMARY KEY, name TEXT, icon TEXT, settings_json TEXT,
+                                  sort_order INTEGER, created_at INTEGER, updated_at INTEGER);
+             CREATE TABLE memories (id TEXT PRIMARY KEY, space_id TEXT, scope TEXT, type TEXT,
+                                    content TEXT, confidence REAL, salience REAL, status TEXT,
+                                    pinned INTEGER DEFAULT 0, use_count INTEGER DEFAULT 0,
+                                    source_hash TEXT, created_at INTEGER, updated_at INTEGER,
+                                    last_used_at INTEGER, edited_at INTEGER);
+             CREATE TABLE tombstones (id TEXT PRIMARY KEY, fingerprint TEXT, scope TEXT,
+                                      space_id TEXT, reason TEXT, created_at INTEGER, created_by TEXT);
+             INSERT INTO spaces VALUES ('sp1', 'Imported Space', NULL, NULL, 1, 111, 111);
+             INSERT INTO memories VALUES ('m1','sp1','space','fact','user prefers pnpm', 0.9, 0.5,
+                                          'active', 1, 3, 'hash1', 100, 200, 150, 200);
+             INSERT INTO memories VALUES ('m2',NULL,'global','decision','ship native rust', NULL, NULL,
+                                          'active', 0, 0, NULL, 100, 200, NULL, 200);
+             INSERT INTO memories VALUES ('m3','sp1','space','fact','deleted thing', NULL, NULL,
+                                          'tombstoned', 0, 0, 'hash3', 100, 200, NULL, 200);
+             INSERT INTO tombstones VALUES ('t1','hash3','space','sp1','user',300,'user');
+             PRAGMA user_version = 6;",
+        )
+        .map_err(|e| e.to_string())?;
+    }
+
+    let native = Db::open(&dir.join("native.db"))?;
+    let report = native.import_from_electron(&src_path)?;
+    expect(report.spaces == 1, "space imported")?;
+    expect(report.memories == 2, "active memories imported")?;
+    expect(report.skipped == 1, "tombstoned memory skipped")?;
+    expect(report.tombstones == 1, "tombstone ledger imported")?;
+
+    let rows = native.list_memories("sp1");
+    expect(rows.len() == 2, "imported space sees its memory + the global one")?;
+    expect(
+        rows.iter().any(|m| m.content == "user prefers pnpm" && m.pinned),
+        "pin state survived import",
+    )?;
+    expect(
+        native.list_spaces().iter().any(|s| s.name == "Imported Space"),
+        "imported space listed",
+    )?;
+
+    let again = native.import_from_electron(&src_path)?;
+    expect(
+        again.memories == 0 && again.spaces == 0 && again.tombstones == 0,
+        "second import is a no-op (idempotent)",
+    )?;
+
+    // The guard still refuses to OPEN the Electron db as our own.
+    expect(
+        Db::open(&src_path).is_err(),
+        "native open refuses the electron db",
+    )?;
+    let _ = std::fs::remove_dir_all(dir);
+    Ok(())
+}
+
 #[cfg(unix)]
 fn check_pty_end_to_end() -> Result<(), String> {
     let osc = Arc::new(RwLock::new(osc_from_theme(theme::theme_by_id("one-dark"))));
@@ -431,6 +546,9 @@ pub fn run() -> i32 {
         ("shell process detection", check_shell_detection),
         ("prompt parser filters", check_prompt_parser_filters),
         ("prompt feed incremental reads", check_prompt_feed_incremental),
+        ("secret redaction", check_redaction),
+        ("memory crud + tombstones", check_memory_crud),
+        ("electron db import", check_electron_import),
     ];
     #[cfg(unix)]
     {

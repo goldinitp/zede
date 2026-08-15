@@ -4,6 +4,7 @@ mod app;
 mod capture;
 mod db;
 mod pty;
+mod redact;
 mod selftest;
 mod settings;
 mod term;
@@ -18,6 +19,25 @@ fn main() {
     }
     if args.iter().any(|a| a == "--selftest") {
         std::process::exit(selftest::run());
+    }
+    if let Some(pos) = args.iter().position(|a| a == "--import-electron") {
+        let source = args
+            .get(pos + 1)
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(app::electron_db_path);
+        match app::open_db().and_then(|db| db.import_from_electron(&source)) {
+            Ok(r) => {
+                println!(
+                    "imported {} memories, {} spaces, {} tombstones ({} skipped) from {}",
+                    r.memories, r.spaces, r.tombstones, r.skipped, source.display()
+                );
+                return;
+            }
+            Err(e) => {
+                eprintln!("import failed: {e}");
+                std::process::exit(1);
+            }
+        }
     }
 
     let viewport = egui::ViewportBuilder::default()

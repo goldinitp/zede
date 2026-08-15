@@ -61,9 +61,14 @@ performance. This document is the working plan; `README.md` covers building.
   Claude-tab transcript paths are deterministic, so the navigator polls one
   file per chat (2s stat) — the `notify` watcher over `~/.claude/projects`
   is only needed for cross-session memory capture and moves to P6.
-- **P6 — memory pipeline**: redact → extract (`claude -p` / heuristic) →
-  store; memory sidebar; `.zede/context.md` injection writer; import of the
-  existing Electron `loom.db`.
+- **P6 — memory pipeline**: schema (memories + append-only tombstones,
+  column-compatible with the Electron v6 shape), secret redaction (ported
+  rule-for-rule), memory sidebar (⌘M: search, pin, forget), and the one-way
+  read-only Electron importer (UI button + `zede --import-electron`;
+  verified against the real db: 2,415 memories). ✅
+  Remaining: extraction (`claude -p` / heuristic over captured spans, using
+  the P5 parser + redaction), the `notify` watcher for sessions Zede didn't
+  spawn, and the `.zede/context.md` injection writer.
 - **P7 — sync**: git-backed sync port (device-flow auth, merge rules,
   tombstones, optional encryption).
 - **P8 — packaging**: `.app` bundle + icon + dmg; CI matrix (macOS arm64/x64,
