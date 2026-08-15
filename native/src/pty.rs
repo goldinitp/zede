@@ -223,3 +223,50 @@ pub fn process_name(pid: i32) -> Option<String> {
 pub fn process_name(_pid: i32) -> Option<String> {
     None
 }
+
+/// Live working directory of a process — how a shell tab that `cd`s away and
+/// then runs `claude` still gets its transcript discovered. Best-effort.
+#[cfg(target_os = "macos")]
+pub fn process_cwd(pid: i32) -> Option<std::path::PathBuf> {
+    // proc_pidinfo(PROC_PIDVNODEPATHINFO): returns struct proc_vnodepathinfo
+    // { vnode_info_path pvi_cdir; vnode_info_path pvi_rdir; } where
+    // vnode_info_path = { vnode_info (152 bytes); char vip_path[MAXPATHLEN] }.
+    // Stable Darwin ABI, used by lsof and friends. The cwd string lives at
+    // offset 152 of the buffer.
+    const PROC_PIDVNODEPATHINFO: libc::c_int = 9;
+    const VNODE_INFO_SIZE: usize = 152;
+    const MAXPATHLEN: usize = 1024;
+    const VNODE_INFO_PATH_SIZE: usize = VNODE_INFO_SIZE + MAXPATHLEN;
+    const BUF_SIZE: usize = 2 * VNODE_INFO_PATH_SIZE;
+
+    let mut buf = [0u8; BUF_SIZE];
+    let n = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            PROC_PIDVNODEPATHINFO,
+            0,
+            buf.as_mut_ptr() as *mut libc::c_void,
+            BUF_SIZE as libc::c_int,
+        )
+    };
+    if n <= 0 {
+        return None;
+    }
+    let path_bytes = &buf[VNODE_INFO_SIZE..VNODE_INFO_SIZE + MAXPATHLEN];
+    let end = path_bytes.iter().position(|b| *b == 0)?;
+    if end == 0 {
+        return None;
+    }
+    let path = std::str::from_utf8(&path_bytes[..end]).ok()?;
+    Some(std::path::PathBuf::from(path))
+}
+
+#[cfg(target_os = "linux")]
+pub fn process_cwd(pid: i32) -> Option<std::path::PathBuf> {
+    std::fs::read_link(format!("/proc/{pid}/cwd")).ok()
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+pub fn process_cwd(_pid: i32) -> Option<std::path::PathBuf> {
+    None
+}

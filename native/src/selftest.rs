@@ -777,6 +777,45 @@ fn check_ranker_fts_term() -> Result<(), String> {
     Ok(())
 }
 
+fn check_process_cwd() -> Result<(), String> {
+    if cfg!(any(target_os = "macos", target_os = "linux")) {
+        let me = std::process::id() as i32;
+        let cwd = pty::process_cwd(me).ok_or("own cwd readable")?;
+        let expected = std::env::current_dir().map_err(|e| e.to_string())?;
+        expect(
+            cwd == expected,
+            &format!("live cwd matches env::current_dir ({} vs {})", cwd.display(), expected.display()),
+        )?;
+    }
+    Ok(())
+}
+
+fn check_transcript_discovery() -> Result<(), String> {
+    use crate::capture::newest_transcript;
+    let dir = std::env::temp_dir().join(format!("zede-selftest-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+
+    let old_id = uuid::Uuid::new_v4().to_string();
+    let new_id = uuid::Uuid::new_v4().to_string();
+    let internal_id = uuid::Uuid::new_v4().to_string();
+    std::fs::write(dir.join(format!("{old_id}.jsonl")), "{}").map_err(|e| e.to_string())?;
+    std::fs::write(dir.join("not-a-session.jsonl"), "{}").map_err(|e| e.to_string())?;
+    std::fs::write(dir.join("readme.txt"), "x").map_err(|e| e.to_string())?;
+    std::thread::sleep(Duration::from_millis(1100)); // fs mtime granularity
+    std::fs::write(dir.join(format!("{new_id}.jsonl")), "{}").map_err(|e| e.to_string())?;
+    std::fs::write(dir.join(format!("{internal_id}.jsonl")), "{}").map_err(|e| e.to_string())?;
+    extract::mark_internal_session(&internal_id);
+
+    let (_, sid, mtime) = newest_transcript(&dir, 0).ok_or("discovery finds a transcript")?;
+    expect(sid == new_id, "newest valid session wins; internal + non-uuid files ignored")?;
+    let none = newest_transcript(&dir, mtime + 60_000);
+    expect(none.is_none(), "sessions older than the tab are not bound")?;
+    let (_, sid_old, _) = newest_transcript(&dir, 0).ok_or("still finds")?;
+    expect(sid_old == new_id, "stable result on rescan")?;
+    let _ = std::fs::remove_dir_all(dir);
+    Ok(())
+}
+
 fn check_sync_format_roundtrip() -> Result<(), String> {
     use crate::db::FullMemoryRow;
     use crate::sync::format::{parse_memory_file, safe_name, serialize_memory};
@@ -1101,6 +1140,8 @@ pub fn run() -> i32 {
         ("fts index + search", check_fts_search),
         ("fts match query builder", check_match_query),
         ("ranker lexical term", check_ranker_fts_term),
+        ("live process cwd", check_process_cwd),
+        ("transcript discovery", check_transcript_discovery),
         ("sync format roundtrip", check_sync_format_roundtrip),
         ("sync export determinism + redaction", check_sync_export),
         ("sync merge rules", check_sync_merge_rules),

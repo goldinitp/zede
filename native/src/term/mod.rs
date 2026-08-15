@@ -181,6 +181,9 @@ pub struct TermSession {
     killer: Box<dyn ChildKiller + Send + Sync>,
     pub shared: Arc<SessionShared>,
     pub session_id: String,
+    /// Wall-clock spawn time — transcript discovery only binds sessions
+    /// started during this tab's lifetime.
+    pub started_epoch_ms: i64,
     #[allow(dead_code)] // "resumed session" badge (P5)
     pub resumed: bool,
     pub kind: TabKind,
@@ -345,6 +348,10 @@ impl TermSession {
             master,
             killer,
             shared,
+            started_epoch_ms: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as i64)
+                .unwrap_or(0),
             session_id: plan.session_id,
             resumed: plan.resumed,
             kind,
@@ -379,6 +386,11 @@ impl TermSession {
 
     pub fn mode(&self) -> TermMode {
         *self.term.lock().mode()
+    }
+
+    /// Foreground process-group leader pid (uncached; one cheap syscall).
+    pub fn foreground_pid(&self) -> Option<i32> {
+        self.master.process_group_leader().map(|pid| pid as i32)
     }
 
     /// Foreground process name of the PTY (cached ~500ms). Drives the

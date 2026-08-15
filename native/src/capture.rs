@@ -34,6 +34,10 @@ impl PromptFeed {
         PromptFeed { path, offset: 0, prompts: Vec::new(), last_poll: None }
     }
 
+    pub fn path(&self) -> &std::path::Path {
+        &self.path
+    }
+
     /// Read any newly completed transcript lines (throttled). Returns true
     /// when new prompts were appended.
     pub fn poll(&mut self) -> bool {
@@ -94,6 +98,43 @@ impl PromptFeed {
         self.offset += consumed as u64;
         added
     }
+}
+
+/// Newest plausible session transcript in a project's transcript directory:
+/// `<uuid>.jsonl`, not an internal (extractor) session, modified at or after
+/// `min_mtime_ms`. This is how sessions Zede didn't spawn (a `claude` typed
+/// into a shell tab) get discovered and bound to the tab.
+pub fn newest_transcript(
+    dir: &std::path::Path,
+    min_mtime_ms: i64,
+) -> Option<(PathBuf, String, i64)> {
+    let entries = std::fs::read_dir(dir).ok()?;
+    let mut best: Option<(PathBuf, String, i64)> = None;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let Some(stem) = name.strip_suffix(".jsonl") else { continue };
+        if !crate::pty::is_uuid(stem) || crate::extract::is_internal_session(stem) {
+            continue;
+        }
+        let Ok(meta) = entry.metadata() else { continue };
+        if !meta.is_file() {
+            continue;
+        }
+        let mtime_ms = meta
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        if mtime_ms < min_mtime_ms {
+            continue;
+        }
+        if best.as_ref().map_or(true, |(_, _, m)| mtime_ms > *m) {
+            best = Some((path, stem.to_string(), mtime_ms));
+        }
+    }
+    best
 }
 
 /// Extract the user prompt from one transcript JSONL record, applying the

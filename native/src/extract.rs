@@ -233,19 +233,43 @@ pub fn parse_candidates(stdout: &str) -> Vec<Candidate> {
     out
 }
 
+/// Sessions Zede itself starts (the `claude -p` extractor) must be invisible
+/// to transcript discovery: re-capturing extractor output would feed the
+/// extractor its own spans — an unbounded model-call loop. Callers register
+/// the session id BEFORE spawning; discovery checks it. In-memory only: the
+/// temp-dir cwd isolation is what keeps old extractor transcripts out of
+/// reach across restarts.
+fn internal_sessions() -> &'static std::sync::Mutex<Vec<String>> {
+    static IDS: OnceLock<std::sync::Mutex<Vec<String>>> = OnceLock::new();
+    IDS.get_or_init(|| std::sync::Mutex::new(Vec::new()))
+}
+
+pub fn mark_internal_session(id: &str) {
+    if let Ok(mut ids) = internal_sessions().lock() {
+        ids.push(id.to_string());
+    }
+}
+
+pub fn is_internal_session(id: &str) -> bool {
+    internal_sessions()
+        .lock()
+        .map(|ids| ids.iter().any(|x| x == id))
+        .unwrap_or(false)
+}
+
 /// Run `claude -p` over a redacted span. Blocking (called from the worker
 /// thread). `None` = claude could not be run at all (caller may fall back);
 /// `Some(vec)` = it ran, possibly finding nothing.
 ///
 /// The child claude writes its own transcript under the temp dir's cwd slug —
-/// never a watched project directory — so capture can't re-distill extractor
-/// output into an unbounded model-call loop. (When the P6 `notify` watcher
-/// lands, also register this session id as internal before spawning.)
+/// never a watched project directory — and its session id is registered as
+/// internal, so discovery can't re-distill extractor output.
 pub fn claude_extract(span: &str) -> Option<Vec<Candidate>> {
     if span.trim().is_empty() {
         return Some(Vec::new());
     }
     let session_id = uuid::Uuid::new_v4().to_string();
+    mark_internal_session(&session_id);
     let mut child = std::process::Command::new("claude")
         .args([
             "-p", span,

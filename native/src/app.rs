@@ -10,7 +10,7 @@ use std::time::Instant;
 use alacritty_terminal::vte::ansi::{CursorShape as AnsiCursorShape, CursorStyle as AnsiCursorStyle};
 use egui::{Align2, Color32, CornerRadius, Frame, Key, Modifiers, RichText, Vec2};
 
-use crate::capture::PromptFeed;
+use crate::capture::{self, PromptFeed};
 use crate::db::{Db, MemoryRow, SpaceRow, TabRow};
 use crate::extract;
 use crate::inject;
@@ -48,6 +48,8 @@ pub struct ZedeApp {
     import_report: Option<String>,
     /// How many of each feed's prompts have been through the learn pipeline.
     extracted_upto: HashMap<String, usize>,
+    /// Per-tab throttle for transcript discovery scans.
+    discovery_at: HashMap<String, Instant>,
     last_learned: Option<(Instant, usize)>,
     learn_tx: std::sync::mpsc::Sender<extract::LearnRequest>,
     learn_rx: std::sync::mpsc::Receiver<extract::LearnResult>,
@@ -245,6 +247,7 @@ impl ZedeApp {
             electron_db_available: electron_db_path().exists(),
             import_report: None,
             extracted_upto: HashMap::new(),
+            discovery_at: HashMap::new(),
             last_learned: None,
             learn_tx,
             learn_rx,
@@ -478,6 +481,8 @@ impl ZedeApp {
             Action::CloseTab(id) => {
                 self.sessions.remove(&id);
                 self.prompt_feeds.remove(&id);
+                self.discovery_at.remove(&id);
+                self.extracted_upto.remove(&id);
                 self.spawn_errors.remove(&id);
                 self.no_resume_once.remove(&id);
                 self.db.delete_tab(&id);
@@ -674,12 +679,45 @@ impl eframe::App for ZedeApp {
         let th = self.theme;
         let mut pending: Vec<Action> = Vec::new();
 
-        // --- capture: poll the active chat's transcript; queue new prompts
-        // for the extraction worker (redact -> extract off-thread), and store
-        // finished results here (the db stays single-writer) -----------------
+        // --- capture: every live tab in this Space tails its transcript.
+        // Discovery binds sessions Zede didn't spawn (a `claude` typed into a
+        // shell tab, using the tab's LIVE cwd); polling queues new prompts for
+        // the extraction worker; results store here (db stays single-writer).
         {
             let mut auto_title: Option<(String, String)> = None;
-            if let Some(tab) = self.current_tab() {
+            let mut rebinds: Vec<(String, std::path::PathBuf, String)> = Vec::new();
+            let tabs_snapshot = self.tabs.clone();
+            for tab in &tabs_snapshot {
+                let Some(session) = self.sessions.get(&tab.id) else { continue };
+                if session.is_dead() {
+                    continue;
+                }
+                let started = session.started_epoch_ms;
+                let fg_pid = session.foreground_pid();
+                let due = self
+                    .discovery_at
+                    .get(&tab.id)
+                    .map(|at| at.elapsed().as_secs() >= 2)
+                    .unwrap_or(true);
+                if due {
+                    self.discovery_at.insert(tab.id.clone(), Instant::now());
+                    let live_cwd = fg_pid
+                        .and_then(pty::process_cwd)
+                        .map(|p| p.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| tab.cwd.clone());
+                    let dir = pty::transcript_dir_for(&live_cwd);
+                    if let Some((path, sid, _)) = capture::newest_transcript(&dir, started) {
+                        let bound = self
+                            .prompt_feeds
+                            .get(&tab.id)
+                            .map(|f| f.path() == path.as_path())
+                            .unwrap_or(false);
+                        if !bound {
+                            rebinds.push((tab.id.clone(), path, sid));
+                        }
+                    }
+                }
+
                 if let Some(feed) = self.prompt_feeds.get_mut(&tab.id) {
                     if feed.poll() {
                         let upto = self
@@ -694,7 +732,7 @@ impl eframe::App for ZedeApp {
                             .collect();
                         if !new.is_empty() {
                             let _ = self.learn_tx.send(extract::LearnRequest {
-                                space_id: self.active_space.clone(),
+                                space_id: tab.space_id.clone(),
                                 span: new.join("\n\n"),
                                 tier: self.settings.extraction_tier.clone(),
                             });
@@ -702,7 +740,7 @@ impl eframe::App for ZedeApp {
                         self.extracted_upto.insert(tab.id.clone(), feed.prompts.len());
                     }
                     // Default-titled chats take their first prompt as a title.
-                    if tab.title == "New chat" {
+                    if tab.title == "New chat" && auto_title.is_none() {
                         if let Some(first) = feed.prompts.first() {
                             let mut t: String = first.text.chars().take(30).collect();
                             if first.text.chars().count() > 30 {
@@ -711,9 +749,18 @@ impl eframe::App for ZedeApp {
                             auto_title = Some((tab.id.clone(), t));
                         }
                     }
-                    // Keep polling alive while the pane is idle.
-                    ctx.request_repaint_after(std::time::Duration::from_secs(2));
                 }
+            }
+            for (tab_id, path, sid) in rebinds {
+                self.prompt_feeds.insert(tab_id.clone(), PromptFeed::new(path));
+                self.extracted_upto.insert(tab_id.clone(), 0);
+                if pty::is_uuid(&sid) {
+                    self.db.set_tab_last_session(&tab_id, &sid);
+                }
+            }
+            if !self.sessions.is_empty() {
+                // Keep capture ticking while panes are idle.
+                ctx.request_repaint_after(std::time::Duration::from_secs(2));
             }
             if let Some((id, title)) = auto_title {
                 self.db.rename_tab(&id, &title);
