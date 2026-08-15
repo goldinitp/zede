@@ -1,0 +1,640 @@
+//! The app shell: Spaces rail, tab sidebar, terminal pane, settings window.
+//! Owns the db, settings, theme, and the map of live PTY sessions (sessions
+//! survive Space switches; a tab's PTY dies only when the tab closes).
+
+use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
+use std::sync::{Arc, RwLock};
+
+use alacritty_terminal::vte::ansi::{CursorShape as AnsiCursorShape, CursorStyle as AnsiCursorStyle};
+use egui::{Align2, Color32, CornerRadius, Frame, Key, Modifiers, RichText, Vec2};
+
+use crate::db::{Db, SpaceRow, TabRow};
+use crate::pty::{self, TabKind};
+use crate::settings::{self, CursorStyleKind, Settings};
+use crate::term::{OscColors, TermSession};
+use crate::theme::{self, AppTheme};
+use crate::ui::sidebar::{self, Action, SidebarState, TabLive};
+use crate::ui::{settings_panel, terminal};
+
+pub struct ZedeApp {
+    db: Db,
+    settings: Settings,
+    theme: &'static AppTheme,
+    osc: Arc<RwLock<OscColors>>,
+    spaces: Vec<SpaceRow>,
+    tabs: Vec<TabRow>,
+    active_space: String,
+    active_tab: HashMap<String, String>,
+    sessions: HashMap<String, TermSession>,
+    spawn_errors: HashMap<String, String>,
+    /// Tabs whose next spawn must be fresh (post-crash restart).
+    no_resume_once: HashSet<String>,
+    sidebar_state: SidebarState,
+    sidebar_visible: bool,
+    show_settings: bool,
+    focus_terminal: bool,
+}
+
+fn db_path() -> PathBuf {
+    if let Ok(dir) = std::env::var("ZEDE_DATA_DIR") {
+        return PathBuf::from(dir).join("zede.db");
+    }
+    // "ZedeNative", not "Zede": that directory belongs to the Electron app
+    // (Chromium storage + its own schema-v6 zede.db). P6 imports from it and
+    // unifies the location once the importer exists.
+    dirs::data_dir()
+        .unwrap_or_else(|| dirs::home_dir().unwrap_or_else(|| PathBuf::from(".")))
+        .join("ZedeNative")
+        .join("zede.db")
+}
+
+pub fn osc_from_theme(t: &AppTheme) -> OscColors {
+    let mut ansi = [alacritty_terminal::vte::ansi::Rgb { r: 0, g: 0, b: 0 }; 16];
+    for (i, c) in t.term.ansi.iter().enumerate() {
+        ansi[i] = theme::to_ansi_rgb(*c);
+    }
+    OscColors {
+        ansi,
+        foreground: theme::to_ansi_rgb(t.term.foreground),
+        background: theme::to_ansi_rgb(t.term.background),
+        cursor: theme::to_ansi_rgb(t.term.cursor),
+    }
+}
+
+fn apply_visuals(ctx: &egui::Context, t: &AppTheme) {
+    let mut v = egui::Visuals::dark();
+    v.panel_fill = t.chrome.chrome;
+    v.window_fill = t.chrome.chrome;
+    v.window_stroke = egui::Stroke::new(1.0_f32, t.chrome.titlebar_1);
+    v.override_text_color = Some(t.chrome.text_2);
+    v.selection.bg_fill =
+        Color32::from_rgba_unmultiplied(t.chrome.accent.r(), t.chrome.accent.g(), t.chrome.accent.b(), 70);
+    ctx.set_visuals(v);
+}
+
+/// Load an installed Nerd Font so powerline prompts render; egui's bundled
+/// Hack covers everything else.
+fn find_nerd_font() -> Option<Vec<u8>> {
+    let mut dirs_to_scan: Vec<PathBuf> = Vec::new();
+    if let Some(home) = dirs::home_dir() {
+        dirs_to_scan.push(home.join("Library/Fonts"));
+        dirs_to_scan.push(home.join(".local/share/fonts"));
+    }
+    dirs_to_scan.push(PathBuf::from("/Library/Fonts"));
+    dirs_to_scan.push(PathBuf::from("/usr/share/fonts"));
+
+    let mut best: Option<(u8, PathBuf)> = None;
+    for dir in dirs_to_scan {
+        let Ok(entries) = std::fs::read_dir(&dir) else { continue };
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_lowercase();
+            let is_font = name.ends_with(".ttf") || name.ends_with(".otf");
+            let is_nerd = name.contains("nerd") || name.contains(" nf ") || name.contains(" nf.");
+            if !is_font || !is_nerd || !name.contains("regular") {
+                continue;
+            }
+            let rank = if name.contains("meslo") {
+                0
+            } else if name.contains("jetbrains") {
+                1
+            } else if name.contains("fira") {
+                2
+            } else if name.contains("hack") {
+                3
+            } else {
+                9
+            };
+            if best.as_ref().map_or(true, |(r, _)| rank < *r) {
+                best = Some((rank, entry.path()));
+            }
+        }
+    }
+    best.and_then(|(_, path)| std::fs::read(path).ok())
+}
+
+fn install_fonts(ctx: &egui::Context) {
+    let mut defs = egui::FontDefinitions::default();
+    if let Some(bytes) = find_nerd_font() {
+        defs.font_data
+            .insert("nerd".to_string(), Arc::new(egui::FontData::from_owned(bytes)));
+        if let Some(family) = defs.families.get_mut(&egui::FontFamily::Monospace) {
+            family.insert(0, "nerd".to_string());
+        }
+    }
+    ctx.set_fonts(defs);
+}
+
+impl ZedeApp {
+    pub fn new(cc: &eframe::CreationContext<'_>) -> Result<ZedeApp, String> {
+        install_fonts(&cc.egui_ctx);
+
+        let db = Db::open(&db_path())?;
+        db.ensure_seed();
+        let settings = Settings::load(&db);
+        let th = theme::theme_by_id(&settings.theme);
+        apply_visuals(&cc.egui_ctx, th);
+
+        let spaces = db.list_spaces();
+        let active_space = db
+            .meta_get("active_space")
+            .filter(|id| spaces.iter().any(|s| &s.id == id))
+            .or_else(|| spaces.iter().find(|s| s.is_default).map(|s| s.id.clone()))
+            .or_else(|| spaces.first().map(|s| s.id.clone()))
+            .ok_or("no spaces after seed")?;
+
+        let mut app = ZedeApp {
+            db,
+            settings,
+            theme: th,
+            osc: Arc::new(RwLock::new(osc_from_theme(th))),
+            spaces,
+            tabs: Vec::new(),
+            active_space,
+            active_tab: HashMap::new(),
+            sessions: HashMap::new(),
+            spawn_errors: HashMap::new(),
+            no_resume_once: HashSet::new(),
+            sidebar_state: SidebarState::default(),
+            sidebar_visible: true,
+            show_settings: false,
+            focus_terminal: true,
+        };
+        app.load_tabs();
+        Ok(app)
+    }
+
+    fn load_tabs(&mut self) {
+        let mut tabs = self.db.list_tabs(&self.active_space);
+        tabs.sort_by_key(|t| (!t.pinned, t.sort_order));
+        self.tabs = tabs;
+        let stored = self.active_tab.get(&self.active_space).cloned().or_else(|| {
+            self.db.meta_get(&format!("active_tab:{}", self.active_space))
+        });
+        let valid = stored.filter(|id| self.tabs.iter().any(|t| &t.id == id));
+        let chosen = valid.or_else(|| self.tabs.first().map(|t| t.id.clone()));
+        if let Some(id) = chosen {
+            self.active_tab.insert(self.active_space.clone(), id);
+        } else {
+            self.active_tab.remove(&self.active_space);
+        }
+    }
+
+    fn current_tab(&self) -> Option<TabRow> {
+        let id = self.active_tab.get(&self.active_space)?;
+        self.tabs.iter().find(|t| &t.id == id).cloned()
+    }
+
+    fn set_active_tab(&mut self, id: String) {
+        self.db
+            .meta_set(&format!("active_tab:{}", self.active_space), &id);
+        self.active_tab.insert(self.active_space.clone(), id);
+        self.focus_terminal = true;
+    }
+
+    fn cursor_style(&self) -> AnsiCursorStyle {
+        AnsiCursorStyle {
+            shape: match self.settings.cursor_style {
+                CursorStyleKind::Block => AnsiCursorShape::Block,
+                CursorStyleKind::Underline => AnsiCursorShape::Underline,
+                CursorStyleKind::Bar => AnsiCursorShape::Beam,
+            },
+            blinking: self.settings.cursor_blink,
+        }
+    }
+
+    fn spawn_session_for(&mut self, tab: &TabRow, ctx: &egui::Context) {
+        if self.sessions.contains_key(&tab.id) || self.spawn_errors.contains_key(&tab.id) {
+            return;
+        }
+        let fresh_only = self.no_resume_once.remove(&tab.id);
+        let resume = if !fresh_only
+            && tab.kind == TabKind::Claude
+            && tab.pinned
+            && self.settings.restore_pinned_sessions
+        {
+            tab.last_session_id
+                .clone()
+                .filter(|s| pty::is_uuid(s))
+                .filter(|s| pty::transcript_path_for(&tab.cwd, s).exists())
+        } else {
+            None
+        };
+        match TermSession::spawn(
+            tab.kind,
+            &tab.cwd,
+            resume.as_deref(),
+            self.settings.scrollback,
+            self.cursor_style(),
+            Arc::clone(&self.osc),
+            Some(ctx.clone()),
+        ) {
+            Ok(session) => {
+                if tab.kind == TabKind::Claude {
+                    self.db.set_tab_last_session(&tab.id, &session.session_id);
+                }
+                self.sessions.insert(tab.id.clone(), session);
+            }
+            Err(err) => {
+                self.spawn_errors.insert(tab.id.clone(), err);
+            }
+        }
+    }
+
+    fn handle_action(&mut self, action: Action, ctx: &egui::Context) {
+        match action {
+            Action::SelectSpace(id) => {
+                self.active_space = id;
+                self.db.meta_set("active_space", &self.active_space);
+                self.load_tabs();
+                self.focus_terminal = true;
+            }
+            Action::NewSpace => {
+                let name = format!("Space {}", self.spaces.len() + 1);
+                let space = self.db.create_space(&name, None);
+                self.spaces = self.db.list_spaces();
+                self.handle_action(Action::SelectSpace(space.id), ctx);
+            }
+            Action::RenameSpace(id, name) => {
+                self.db.rename_space(&id, &name);
+                self.spaces = self.db.list_spaces();
+            }
+            Action::DeleteSpace(id) => {
+                for tab in self.db.list_tabs(&id) {
+                    self.sessions.remove(&tab.id);
+                    self.spawn_errors.remove(&tab.id);
+                }
+                self.db.delete_space(&id);
+                self.spaces = self.db.list_spaces();
+                if self.active_space == id {
+                    let next = self
+                        .spaces
+                        .first()
+                        .map(|s| s.id.clone())
+                        .unwrap_or_default();
+                    if next.is_empty() {
+                        self.db.ensure_seed();
+                        self.spaces = self.db.list_spaces();
+                    }
+                    let next = self.spaces.first().map(|s| s.id.clone()).unwrap_or_default();
+                    self.handle_action(Action::SelectSpace(next), ctx);
+                } else {
+                    self.load_tabs();
+                }
+            }
+            Action::SetDefaultSpace(id) => {
+                self.db.set_default_space(&id);
+                self.spaces = self.db.list_spaces();
+            }
+            Action::SelectTab(id) => self.set_active_tab(id),
+            Action::NewTab(kind) => {
+                let cwd = self
+                    .current_tab()
+                    .map(|t| t.cwd)
+                    .or_else(|| dirs::home_dir().map(|p| p.to_string_lossy().to_string()))
+                    .unwrap_or_else(|| "/".to_string());
+                let title = match kind {
+                    TabKind::Claude => "New chat",
+                    TabKind::Shell => "Shell",
+                };
+                let tab = self.db.create_tab(&self.active_space, kind, title, &cwd);
+                self.load_tabs();
+                self.set_active_tab(tab.id);
+            }
+            Action::CloseTab(id) => {
+                self.sessions.remove(&id);
+                self.spawn_errors.remove(&id);
+                self.no_resume_once.remove(&id);
+                self.db.delete_tab(&id);
+                if self.active_tab.get(&self.active_space) == Some(&id) {
+                    self.active_tab.remove(&self.active_space);
+                }
+                self.load_tabs();
+            }
+            Action::SetPinned(id, pinned) => {
+                self.db.set_tab_pinned(&id, pinned);
+                self.load_tabs();
+            }
+            Action::RenameTab(id, title) => {
+                self.db.rename_tab(&id, &title);
+                self.load_tabs();
+            }
+        }
+    }
+
+    fn handle_shortcuts(&mut self, ctx: &egui::Context) {
+        let cmd = Modifiers::COMMAND;
+        let mut actions: Vec<Action> = Vec::new();
+        let mut toggle_settings = false;
+        let mut toggle_sidebar = false;
+        let mut clear_terminal = false;
+        let mut select_index: Option<usize> = None;
+        let mut cycle: i32 = 0;
+
+        ctx.input_mut(|i| {
+            if i.consume_key(cmd | Modifiers::SHIFT, Key::T) {
+                actions.push(Action::NewTab(TabKind::Shell));
+            }
+            if i.consume_key(cmd, Key::T) {
+                actions.push(Action::NewTab(TabKind::Claude));
+            }
+            if i.consume_key(cmd, Key::W) {
+                // Sentinel: resolved to the current tab after the input lock.
+                actions.push(Action::CloseTab(String::new()));
+            }
+            if i.consume_key(cmd, Key::Comma) {
+                toggle_settings = true;
+            }
+            if i.consume_key(cmd, Key::S) {
+                toggle_sidebar = true;
+            }
+            if i.consume_key(cmd, Key::K) {
+                clear_terminal = true;
+            }
+            if i.consume_key(cmd | Modifiers::SHIFT, Key::CloseBracket) {
+                cycle = 1;
+            }
+            if i.consume_key(cmd | Modifiers::SHIFT, Key::OpenBracket) {
+                cycle = -1;
+            }
+            let digits = [
+                Key::Num1, Key::Num2, Key::Num3, Key::Num4, Key::Num5,
+                Key::Num6, Key::Num7, Key::Num8, Key::Num9,
+            ];
+            for (idx, key) in digits.iter().enumerate() {
+                if i.consume_key(cmd, *key) {
+                    select_index = Some(idx);
+                }
+            }
+        });
+
+        if toggle_settings {
+            self.show_settings = !self.show_settings;
+        }
+        if toggle_sidebar {
+            self.sidebar_visible = !self.sidebar_visible;
+        }
+        if clear_terminal {
+            if let Some(tab) = self.current_tab() {
+                if let Some(session) = self.sessions.get(&tab.id) {
+                    session.clear_local();
+                }
+            }
+        }
+        if let Some(idx) = select_index {
+            if let Some(tab) = self.tabs.get(idx) {
+                let id = tab.id.clone();
+                self.set_active_tab(id);
+            }
+        }
+        if cycle != 0 && !self.tabs.is_empty() {
+            let current = self.active_tab.get(&self.active_space);
+            let pos = self
+                .tabs
+                .iter()
+                .position(|t| Some(&t.id) == current)
+                .unwrap_or(0);
+            let len = self.tabs.len() as i32;
+            let next = ((pos as i32 + cycle) % len + len) % len;
+            let id = self.tabs[next as usize].id.clone();
+            self.set_active_tab(id);
+        }
+        for action in actions {
+            match action {
+                Action::CloseTab(id) if id.is_empty() => {
+                    if let Some(tab) = self.current_tab() {
+                        self.handle_action(Action::CloseTab(tab.id), ctx);
+                    }
+                }
+                other => self.handle_action(other, ctx),
+            }
+        }
+    }
+
+    fn dead_overlay(
+        &self,
+        ctx: &egui::Context,
+        rect: egui::Rect,
+        tab_id: &str,
+        exit_code: i32,
+    ) -> Option<DeadChoice> {
+        let painter = ctx.layer_painter(egui::LayerId::new(
+            egui::Order::Middle,
+            egui::Id::new(("dead-dim", tab_id)),
+        ));
+        painter.rect_filled(rect, CornerRadius::ZERO, Color32::from_black_alpha(130));
+
+        let mut choice = None;
+        egui::Area::new(egui::Id::new(("dead-overlay", tab_id)))
+            .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
+            .order(egui::Order::Foreground)
+            .show(ctx, |ui| {
+                Frame::NONE
+                    .fill(self.theme.chrome.chrome)
+                    .corner_radius(CornerRadius::from(10.0))
+                    .inner_margin(18.0)
+                    .stroke(egui::Stroke::new(1.0_f32, self.theme.chrome.titlebar_1))
+                    .show(ui, |ui| {
+                        ui.vertical_centered(|ui| {
+                            ui.label(
+                                RichText::new(format!("Session ended (exit {exit_code})"))
+                                    .color(self.theme.chrome.text)
+                                    .size(13.5),
+                            );
+                            ui.add_space(10.0);
+                            ui.horizontal(|ui| {
+                                if ui.button("Restart session").clicked() {
+                                    choice = Some(DeadChoice::Restart);
+                                }
+                                if ui.button("Close tab").clicked() {
+                                    choice = Some(DeadChoice::Close);
+                                }
+                            });
+                        });
+                    });
+            });
+        choice
+    }
+}
+
+enum DeadChoice {
+    Restart,
+    Close,
+}
+
+impl eframe::App for ZedeApp {
+    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.handle_shortcuts(ctx);
+
+        let th = self.theme;
+        let mut pending: Vec<Action> = Vec::new();
+
+        // --- header bar ------------------------------------------------------
+        egui::TopBottomPanel::top("header")
+            .exact_height(36.0)
+            .frame(Frame::NONE.fill(th.chrome.titlebar_2))
+            .show(ctx, |ui| {
+                ui.horizontal_centered(|ui| {
+                    ui.add_space(12.0);
+                    let space_name = self
+                        .spaces
+                        .iter()
+                        .find(|s| s.id == self.active_space)
+                        .map(|s| s.name.clone())
+                        .unwrap_or_default();
+                    ui.label(RichText::new(space_name).color(th.chrome.text_3).size(12.0));
+                    if let Some(tab) = self.current_tab() {
+                        ui.label(RichText::new("›").color(th.chrome.muted).size(12.0));
+                        let live_title = self
+                            .sessions
+                            .get(&tab.id)
+                            .map(|s| s.title())
+                            .filter(|t| !t.is_empty());
+                        let title = live_title.unwrap_or(tab.title);
+                        ui.label(RichText::new(title).color(th.chrome.text).size(12.5));
+                    }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.add_space(10.0);
+                        if ui
+                            .button(RichText::new("⚙").size(14.0))
+                            .on_hover_text("Settings (⌘,)")
+                            .clicked()
+                        {
+                            self.show_settings = !self.show_settings;
+                        }
+                    });
+                });
+            });
+
+        // --- spaces rail + tab sidebar --------------------------------------
+        if self.sidebar_visible {
+            egui::SidePanel::left("rail")
+                .exact_width(52.0)
+                .resizable(false)
+                .frame(Frame::NONE.fill(th.chrome.editor_header))
+                .show(ctx, |ui| {
+                    if let Some(a) = sidebar::spaces_rail(ui, &self.spaces, &self.active_space, th) {
+                        pending.push(a);
+                    }
+                });
+
+            let space = self
+                .spaces
+                .iter()
+                .find(|s| s.id == self.active_space)
+                .cloned();
+            if let Some(space) = space {
+                // Live info for icons (foreground proc needs &mut session).
+                let mut live: HashMap<String, TabLive> = HashMap::new();
+                for tab in &self.tabs {
+                    if let Some(session) = self.sessions.get_mut(&tab.id) {
+                        live.insert(
+                            tab.id.clone(),
+                            TabLive {
+                                proc: session.foreground_proc(),
+                                dead: session.is_dead(),
+                                live: true,
+                            },
+                        );
+                    }
+                }
+                let active_tab = self.active_tab.get(&self.active_space).cloned();
+                egui::SidePanel::left("tabs")
+                    .default_width(212.0)
+                    .width_range(170.0..=320.0)
+                    .frame(Frame::NONE.fill(th.chrome.chrome))
+                    .show(ctx, |ui| {
+                        if let Some(a) = sidebar::tab_panel(
+                            ui,
+                            &space,
+                            &self.tabs,
+                            active_tab.as_deref(),
+                            &live,
+                            th,
+                            &mut self.sidebar_state,
+                        ) {
+                            pending.push(a);
+                        }
+                    });
+            }
+        }
+
+        // --- terminal --------------------------------------------------------
+        egui::CentralPanel::default()
+            .frame(Frame::NONE.fill(th.term.background))
+            .show(ctx, |ui| {
+                let Some(tab) = self.current_tab() else {
+                    ui.centered_and_justified(|ui| {
+                        ui.label(
+                            RichText::new("⌘T — new Claude tab")
+                                .color(th.chrome.muted)
+                                .size(14.0),
+                        );
+                    });
+                    return;
+                };
+
+                self.spawn_session_for(&tab, ctx);
+
+                if let Some(err) = self.spawn_errors.get(&tab.id).cloned() {
+                    ui.centered_and_justified(|ui| {
+                        ui.vertical_centered(|ui| {
+                            ui.label(
+                                RichText::new(format!("Failed to start terminal: {err}"))
+                                    .color(th.chrome.red),
+                            );
+                            ui.add_space(8.0);
+                            if ui.button("Retry").clicked() {
+                                self.spawn_errors.remove(&tab.id);
+                            }
+                        });
+                    });
+                    return;
+                }
+
+                let focus = self.focus_terminal;
+                self.focus_terminal = false;
+                let (resp_rect, dead, exit_code) = {
+                    let session = self.sessions.get_mut(&tab.id).expect("session spawned");
+                    let resp = terminal::terminal_view(ui, session, th, &self.settings, focus);
+                    (resp.rect, session.is_dead(), session.exit_code())
+                };
+
+                if dead {
+                    match self.dead_overlay(ctx, resp_rect, &tab.id, exit_code) {
+                        Some(DeadChoice::Restart) => {
+                            self.sessions.remove(&tab.id);
+                            self.no_resume_once.insert(tab.id.clone());
+                            self.focus_terminal = true;
+                        }
+                        Some(DeadChoice::Close) => pending.push(Action::CloseTab(tab.id.clone())),
+                        None => {}
+                    }
+                }
+            });
+
+        // --- settings --------------------------------------------------------
+        if self.show_settings {
+            let changes =
+                settings_panel::settings_window(ctx, &mut self.show_settings, &self.settings, th);
+            if !changes.is_empty() {
+                let theme_changed = changes.iter().any(|(k, _)| *k == "theme");
+                for (key, value) in &changes {
+                    settings::save_setting(&self.db, key, value);
+                }
+                self.settings = Settings::load(&self.db);
+                if theme_changed {
+                    self.theme = theme::theme_by_id(&self.settings.theme);
+                    if let Ok(mut osc) = self.osc.write() {
+                        *osc = osc_from_theme(self.theme);
+                    }
+                    apply_visuals(ctx, self.theme);
+                }
+            }
+        }
+
+        for action in pending {
+            self.handle_action(action, ctx);
+        }
+    }
+}

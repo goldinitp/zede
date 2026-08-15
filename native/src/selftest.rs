@@ -1,0 +1,362 @@
+//! Headless end-to-end checks (`zede --selftest`): no window, real PTYs.
+//! The native successor to the Electron app's `pnpm selftest`.
+
+use std::sync::{Arc, RwLock};
+use std::time::{Duration, Instant};
+
+use alacritty_terminal::vte::ansi::{CursorShape, CursorStyle};
+use egui::Color32;
+
+use crate::app::osc_from_theme;
+use crate::db::Db;
+use crate::pty::{self, TabKind};
+use crate::settings::{normalize_setting_value, Settings};
+use crate::term::TermSession;
+use crate::theme;
+
+fn block_cursor() -> CursorStyle {
+    CursorStyle { shape: CursorShape::Block, blinking: false }
+}
+
+/// Visible-grid text, joined row by row (for output assertions).
+fn grid_text(session: &TermSession) -> String {
+    let term = session.term.lock();
+    let content = term.renderable_content();
+    let rows = session.rows as usize;
+    let cols = session.cols as usize;
+    let offset = content.display_offset as i32;
+    let mut grid = vec![vec![' '; cols]; rows];
+    for indexed in content.display_iter {
+        let vrow = indexed.point.line.0 + offset;
+        let col = indexed.point.column.0;
+        if vrow >= 0 && (vrow as usize) < rows && col < cols {
+            grid[vrow as usize][col] = indexed.cell.c;
+        }
+    }
+    grid.into_iter()
+        .map(|row| row.into_iter().collect::<String>())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn wait_until(timeout: Duration, mut check: impl FnMut() -> bool) -> bool {
+    let start = Instant::now();
+    while start.elapsed() < timeout {
+        if check() {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    check()
+}
+
+type Check = (&'static str, fn() -> Result<(), String>);
+
+fn expect(cond: bool, msg: &str) -> Result<(), String> {
+    if cond {
+        Ok(())
+    } else {
+        Err(msg.to_string())
+    }
+}
+
+fn temp_db() -> Result<(Db, std::path::PathBuf), String> {
+    let dir = std::env::temp_dir().join(format!("zede-selftest-{}", uuid::Uuid::new_v4()));
+    let path = dir.join("zede.db");
+    let db = Db::open(&path)?;
+    Ok((db, dir))
+}
+
+// --- checks -----------------------------------------------------------------
+
+fn check_db_migrate_seed() -> Result<(), String> {
+    let (db, dir) = temp_db()?;
+    db.ensure_seed();
+    let spaces = db.list_spaces();
+    expect(spaces.len() == 1, "seed creates one space")?;
+    expect(spaces[0].is_default, "seed space is default")?;
+    let tabs = db.list_tabs(&spaces[0].id);
+    expect(tabs.len() == 1, "seed creates one tab")?;
+    expect(tabs[0].kind == TabKind::Claude, "seed tab is a claude tab")?;
+    db.ensure_seed();
+    expect(db.list_spaces().len() == 1, "seed is idempotent")?;
+    let _ = std::fs::remove_dir_all(dir);
+    Ok(())
+}
+
+fn check_db_tab_roundtrip() -> Result<(), String> {
+    let (db, dir) = temp_db()?;
+    let space = db.create_space("Test", None);
+    let tab = db.create_tab(&space.id, TabKind::Claude, "Chat", "/tmp");
+    db.set_tab_pinned(&tab.id, true);
+    db.set_tab_last_session(&tab.id, "0f4bb1f8-0000-4000-8000-000000000000");
+    db.rename_tab(&tab.id, "Renamed");
+    let rows = db.list_tabs(&space.id);
+    expect(rows.len() == 1, "one tab")?;
+    expect(rows[0].pinned, "pin persisted")?;
+    expect(rows[0].title == "Renamed", "rename persisted")?;
+    expect(
+        rows[0].last_session_id.as_deref() == Some("0f4bb1f8-0000-4000-8000-000000000000"),
+        "last session persisted",
+    )?;
+    db.delete_space(&space.id);
+    expect(db.list_tabs(&space.id).is_empty(), "cascade delete")?;
+    let _ = std::fs::remove_dir_all(dir);
+    Ok(())
+}
+
+fn check_settings_normalize() -> Result<(), String> {
+    expect(normalize_setting_value("fontSize", "99") == Some("24".into()), "fontSize clamps high")?;
+    expect(normalize_setting_value("fontSize", "1") == Some("9".into()), "fontSize clamps low")?;
+    expect(normalize_setting_value("scrollback", "100") == Some("500".into()), "scrollback clamps")?;
+    expect(
+        normalize_setting_value("scrollback", "1234.7") == Some("1235".into()),
+        "scrollback rounds to integer",
+    )?;
+    expect(normalize_setting_value("theme", "not-a-theme").is_none(), "invalid theme rejected")?;
+    expect(normalize_setting_value("theme", "dracula") == Some("dracula".into()), "valid theme kept")?;
+    expect(normalize_setting_value("cursorBlink", "yes").is_none(), "bool must be 0/1")?;
+    expect(normalize_setting_value("cursorBlink", "1") == Some("1".into()), "bool 1 ok")?;
+    expect(normalize_setting_value("nonsenseKey", "x").is_none(), "unknown key rejected")?;
+    Ok(())
+}
+
+fn check_settings_defaults() -> Result<(), String> {
+    let (db, dir) = temp_db()?;
+    let s = Settings::load(&db);
+    expect(s == Settings::default(), "empty db loads defaults")?;
+    db.set_setting("fontSize", "16");
+    db.set_setting("theme", "nord");
+    let s = Settings::load(&db);
+    expect((s.font_size - 16.0).abs() < f32::EPSILON, "fontSize load")?;
+    expect(s.theme == "nord", "theme load")?;
+    let _ = std::fs::remove_dir_all(dir);
+    Ok(())
+}
+
+fn check_cwd_encoding() -> Result<(), String> {
+    expect(
+        pty::encode_cwd("/Users/goldi/My Code.app") == "-Users-goldi-My-Code-app",
+        "lossy forward encoding",
+    )?;
+    let p = pty::transcript_path_for("/tmp/proj", "1b9d6bcd-bbfd-4b2d-9b5d-ab8dfbbd4bed");
+    let s = p.to_string_lossy();
+    expect(
+        s.contains(".claude") && s.contains("projects") && s.contains("-tmp-proj"),
+        "transcript path under ~/.claude/projects/<encoded>",
+    )?;
+    expect(s.ends_with("1b9d6bcd-bbfd-4b2d-9b5d-ab8dfbbd4bed.jsonl"), "transcript file name")?;
+    Ok(())
+}
+
+fn check_uuid_guard() -> Result<(), String> {
+    expect(pty::is_uuid("1b9d6bcd-bbfd-4b2d-9b5d-ab8dfbbd4bed"), "lowercase uuid ok")?;
+    expect(pty::is_uuid("1B9D6BCD-BBFD-4B2D-9B5D-AB8DFBBD4BED"), "uppercase uuid ok")?;
+    expect(!pty::is_uuid("not-a-uuid"), "garbage rejected")?;
+    expect(!pty::is_uuid("1b9d6bcd-bbfd-4b2d-9b5d-ab8dfbbd4be"), "short rejected")?;
+    expect(
+        !pty::is_uuid("1b9d6bcd;rm -rf /-4b2d-9b5d-ab8dfbbd4bed"),
+        "injection shape rejected",
+    )?;
+    Ok(())
+}
+
+fn check_spawn_plan_claude() -> Result<(), String> {
+    let plan = pty::spawn_plan(TabKind::Claude, None);
+    expect(pty::is_uuid(&plan.session_id), "fresh session id is a uuid")?;
+    expect(!plan.resumed, "fresh spawn not resumed")?;
+    if cfg!(unix) {
+        expect(plan.args.len() == 4, "posix claude args: -i -l -c cmd")?;
+        expect(plan.args[0] == "-i" && plan.args[1] == "-l" && plan.args[2] == "-c", "interactive login shell")?;
+        let cmd = &plan.args[3];
+        expect(
+            cmd.contains(&format!("claude --session-id {}", plan.session_id)),
+            "session id delivered as the shell command",
+        )?;
+        expect(cmd.contains("; exec "), "drops to interactive shell after claude exits")?;
+    }
+    Ok(())
+}
+
+fn check_spawn_plan_resume() -> Result<(), String> {
+    let id = "1b9d6bcd-bbfd-4b2d-9b5d-ab8dfbbd4bed";
+    let plan = pty::spawn_plan(TabKind::Claude, Some(id));
+    expect(plan.resumed, "valid uuid resumes")?;
+    expect(plan.session_id == id, "resume keeps the id")?;
+    if cfg!(unix) {
+        expect(plan.args[3].contains(&format!("claude --resume {id}")), "resume flag")?;
+    }
+    let bad = pty::spawn_plan(TabKind::Claude, Some("evil; rm -rf /"));
+    expect(!bad.resumed, "invalid resume id starts fresh")?;
+    expect(pty::is_uuid(&bad.session_id), "fresh id generated instead")?;
+    if cfg!(unix) {
+        expect(!bad.args[3].contains("evil"), "tampered id never reaches the command")?;
+    }
+    let shell = pty::spawn_plan(TabKind::Shell, None);
+    if cfg!(unix) {
+        expect(shell.args == vec!["-l".to_string()], "shell tab is a login shell")?;
+    }
+    Ok(())
+}
+
+fn check_env_rules() -> Result<(), String> {
+    std::env::set_var("NO_COLOR", "1");
+    std::env::set_var("CURSOR_AGENT", "1");
+    let env = pty::terminal_environment();
+    let get = |k: &str| env.iter().find(|(key, _)| key == k).map(|(_, v)| v.clone());
+    expect(get("NO_COLOR").is_none(), "NO_COLOR stripped")?;
+    expect(get("CURSOR_AGENT").is_none(), "CURSOR_AGENT stripped")?;
+    expect(get("TERM").as_deref() == Some("xterm-256color"), "TERM set")?;
+    expect(get("COLORTERM").as_deref() == Some("truecolor"), "COLORTERM set")?;
+    expect(get("TERM_PROGRAM").as_deref() == Some("Zede"), "TERM_PROGRAM set")?;
+    expect(
+        get("CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN").as_deref() == Some("1"),
+        "alternate screen disabled for claude",
+    )?;
+    std::env::remove_var("NO_COLOR");
+    std::env::remove_var("CURSOR_AGENT");
+    Ok(())
+}
+
+fn check_key_encoding() -> Result<(), String> {
+    use crate::term::keys::{encode_key, encode_paste};
+    use alacritty_terminal::term::TermMode;
+    use egui::{Key, Modifiers};
+
+    let none = Modifiers::NONE;
+    let mode = TermMode::empty();
+    expect(encode_key(Key::Enter, none, mode) == Some(b"\r".to_vec()), "enter -> CR")?;
+    expect(encode_key(Key::ArrowUp, none, mode) == Some(b"\x1b[A".to_vec()), "arrow up CSI")?;
+    expect(
+        encode_key(Key::ArrowUp, none, TermMode::APP_CURSOR) == Some(b"\x1bOA".to_vec()),
+        "arrow up SS3 in app-cursor mode",
+    )?;
+    let ctrl = Modifiers { ctrl: true, ..Default::default() };
+    expect(encode_key(Key::C, ctrl, mode) == Some(vec![0x03]), "ctrl+c -> ETX")?;
+    let shift = Modifiers { shift: true, ..Default::default() };
+    expect(encode_key(Key::Tab, shift, mode) == Some(b"\x1b[Z".to_vec()), "shift+tab backtab")?;
+    expect(
+        encode_key(Key::ArrowRight, ctrl, mode) == Some(b"\x1b[1;5C".to_vec()),
+        "ctrl+arrow modifier param",
+    )?;
+    expect(encode_key(Key::A, none, mode).is_none(), "plain letters come via Text events")?;
+    let cmd = Modifiers { mac_cmd: true, command: true, ..Default::default() };
+    expect(encode_key(Key::C, cmd, mode).is_none(), "cmd combos never reach the pty")?;
+
+    expect(encode_paste("a\nb", false) == b"a\rb".to_vec(), "plain paste LF->CR")?;
+    let bracketed = encode_paste("hi\x1b[201~there", true);
+    expect(
+        bracketed == b"\x1b[200~hithere\x1b[201~".to_vec(),
+        "bracketed paste wraps and strips injected end marker",
+    )?;
+    Ok(())
+}
+
+fn check_color_math() -> Result<(), String> {
+    let th = theme::theme_by_id("one-dark");
+    expect(theme::xterm_256(196, th) == Color32::from_rgb(255, 0, 0), "cube 196 = red")?;
+    expect(theme::xterm_256(232, th) == Color32::from_rgb(8, 8, 8), "grayscale start")?;
+    expect(theme::xterm_256(255, th) == Color32::from_rgb(238, 238, 238), "grayscale end")?;
+    expect(theme::xterm_256(1, th) == th.term.ansi[1], "low indexes come from theme")?;
+    use alacritty_terminal::vte::ansi::{Color as AnsiColor, NamedColor};
+    expect(
+        theme::bold_variant(AnsiColor::Named(NamedColor::Red)) == AnsiColor::Indexed(9),
+        "bold red brightens",
+    )?;
+    Ok(())
+}
+
+fn check_shell_detection() -> Result<(), String> {
+    expect(pty::is_shell_process("-zsh"), "login zsh")?;
+    expect(pty::is_shell_process("/bin/bash"), "path bash")?;
+    expect(pty::is_shell_process("powershell.exe"), "powershell")?;
+    expect(!pty::is_shell_process("claude"), "claude is not a shell")?;
+    expect(!pty::is_shell_process("vim"), "vim is not a shell")?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn check_pty_end_to_end() -> Result<(), String> {
+    let osc = Arc::new(RwLock::new(osc_from_theme(theme::theme_by_id("one-dark"))));
+    let mut session = TermSession::spawn_raw(
+        "/bin/sh",
+        &["-c", "read line; printf 'echoed:%s' \"$line\""],
+        "/tmp",
+        1000,
+        block_cursor(),
+        osc,
+    )?;
+    std::thread::sleep(Duration::from_millis(120));
+    session.write(b"zede-native\r");
+    let ok = wait_until(Duration::from_secs(5), || {
+        grid_text(&session).contains("echoed:zede-native")
+    });
+    expect(ok, "pty output reached the grid (spawn -> write -> parse -> cells)")?;
+    let dead = wait_until(Duration::from_secs(5), || session.is_dead());
+    expect(dead, "reader thread noticed EOF")?;
+    expect(session.exit_code() == 0, "clean exit code")?;
+    session.kill();
+    Ok(())
+}
+
+#[cfg(unix)]
+fn check_pty_scrollback() -> Result<(), String> {
+    let osc = Arc::new(RwLock::new(osc_from_theme(theme::theme_by_id("one-dark"))));
+    let session = TermSession::spawn_raw(
+        "/bin/sh",
+        &["-c", "i=0; while [ $i -lt 60 ]; do echo line-$i; i=$((i+1)); done"],
+        "/tmp",
+        1000,
+        block_cursor(),
+        osc,
+    )?;
+    let ok = wait_until(Duration::from_secs(5), || grid_text(&session).contains("line-59"));
+    expect(ok, "burst output parsed")?;
+    // 60 lines on a 24-row grid: earlier lines must live in scrollback.
+    session.scroll_display(30);
+    let scrolled = grid_text(&session);
+    expect(scrolled.contains("line-1"), "scrollback holds early lines")?;
+    session.scroll_to_bottom();
+    expect(grid_text(&session).contains("line-59"), "scroll to bottom restores tail")?;
+    Ok(())
+}
+
+pub fn run() -> i32 {
+    let mut checks: Vec<Check> = vec![
+        ("db migrate + seed", check_db_migrate_seed),
+        ("db tab roundtrip", check_db_tab_roundtrip),
+        ("settings normalize", check_settings_normalize),
+        ("settings defaults", check_settings_defaults),
+        ("cwd encoding + transcript path", check_cwd_encoding),
+        ("uuid guard", check_uuid_guard),
+        ("spawn plan: claude", check_spawn_plan_claude),
+        ("spawn plan: resume + injection guard", check_spawn_plan_resume),
+        ("terminal env rules", check_env_rules),
+        ("key encoding", check_key_encoding),
+        ("color math", check_color_math),
+        ("shell process detection", check_shell_detection),
+    ];
+    #[cfg(unix)]
+    {
+        checks.push(("pty end-to-end", check_pty_end_to_end));
+        checks.push(("pty scrollback", check_pty_scrollback));
+    }
+
+    let total = checks.len();
+    let mut passed = 0usize;
+    for (name, check) in checks {
+        match check() {
+            Ok(()) => {
+                println!("ok   — {name}");
+                passed += 1;
+            }
+            Err(err) => println!("FAIL — {name}: {err}"),
+        }
+    }
+    println!("selftest: {passed}/{total} passed");
+    if passed == total {
+        0
+    } else {
+        1
+    }
+}
