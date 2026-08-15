@@ -33,6 +33,10 @@ impl CursorStyleKind {
 #[derive(Clone, Debug, PartialEq)]
 pub struct Settings {
     pub restore_pinned_sessions: bool,
+    /// "claude" (higher recall, calls the API) or "heuristic" (offline).
+    /// Stored under the Electron key `extractionTier`; "ollama" (not yet
+    /// ported) loads as heuristic behavior but round-trips unchanged.
+    pub extraction_tier: String,
     pub font_size: f32,
     pub line_height: f32,
     pub letter_spacing: f32,
@@ -46,6 +50,7 @@ impl Default for Settings {
     fn default() -> Self {
         Settings {
             restore_pinned_sessions: true,
+            extraction_tier: "claude".to_string(),
             font_size: 13.0,
             line_height: 1.0,
             letter_spacing: 0.0,
@@ -119,6 +124,7 @@ impl Settings {
             restore_pinned_sessions: get("restorePinnedSessions")
                 .map(|v| v == "1")
                 .unwrap_or(d.restore_pinned_sessions),
+            extraction_tier: get("extractionTier").unwrap_or(d.extraction_tier),
             font_size: num("fontSize", d.font_size),
             line_height: num("lineHeight", d.line_height),
             letter_spacing: num("letterSpacing", d.letter_spacing),

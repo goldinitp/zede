@@ -6,6 +6,7 @@
 //! dedup + tombstone suppression ("forgotten memories never return").
 
 use std::sync::OnceLock;
+use std::time::Duration;
 
 use regex::Regex;
 use sha2::{Digest, Sha256};
@@ -134,13 +135,12 @@ pub fn fingerprint(content: &str) -> String {
     format!("{:x}", hasher.finalize())
 }
 
-/// The learn pipeline for one span of user text: redact -> extract ->
-/// fingerprint-dedupe (existing rows AND tombstones) -> store. Returns the
-/// number of memories stored.
-pub fn learn_from_text(db: &Db, space_id: &str, text: &str) -> usize {
-    let clean = redact::redact(text).text;
+/// Store candidates with fingerprint dedupe against existing rows AND
+/// tombstones. UI thread only — the db has a single writer. Returns the
+/// number stored.
+pub fn store_candidates(db: &Db, space_id: &str, candidates: &[Candidate]) -> usize {
     let mut stored = 0;
-    for cand in extract(&clean) {
+    for cand in candidates {
         let fp = fingerprint(&cand.content);
         if db.has_memory_with_hash(&fp) || db.has_tombstone(&fp) {
             continue;
@@ -153,4 +153,187 @@ pub fn learn_from_text(db: &Db, space_id: &str, text: &str) -> usize {
         stored += 1;
     }
     stored
+}
+
+/// Synchronous heuristic pipeline for one span: redact -> extract -> store.
+pub fn learn_from_text(db: &Db, space_id: &str, text: &str) -> usize {
+    let clean = redact::redact(text).text;
+    let candidates = extract(&clean);
+    store_candidates(db, space_id, &candidates)
+}
+
+// --- claude -p extractor tier ----------------------------------------------
+
+pub const MEMORY_TYPES: [&str; 5] = ["fact", "decision", "preference", "entity", "todo"];
+
+fn static_type(s: &str) -> Option<&'static str> {
+    MEMORY_TYPES.iter().find(|t| **t == s).copied()
+}
+
+const SCHEMA: &str = r#"{"type":"object","additionalProperties":false,"properties":{"memories":{"type":"array","items":{"type":"object","additionalProperties":false,"properties":{"type":{"type":"string","enum":["fact","decision","preference","entity","todo"]},"content":{"type":"string"},"confidence":{"type":"number"},"scope_hint":{"type":"string","enum":["space","global"]}},"required":["type","content","confidence"]}}},"required":["memories"]}"#;
+
+const SYSTEM: &str = "You extract DURABLE memories from a coding-session transcript span — things that will still matter weeks from now. \
+Return ONLY structured JSON matching the schema: an object with a \"memories\" array. \
+Each memory: {type, content, confidence 0..1, scope_hint}. type in {fact,decision,preference,entity,todo}. \
+CAPTURE: stable facts about the user, project, or domain; architectural/product decisions and WHY; the user's standing \
+preferences and conventions; important named entities (services, tools, people, key files); and genuine open tasks that outlive this session. \
+DO NOT CAPTURE (omit entirely): transient or procedural steps (run/restart/rebuild/install commands, \"npm run dev\", git steps); \
+ephemeral debugging notes, hypotheses, root-cause guesses, or the status of work in progress; anything about the assistant's own \
+process or this memory tool itself; greetings, acknowledgements, and command/tool output noise; todos obsolete once this session ends. \
+When unsure whether something is durable, OMIT it — prefer a few high-signal memories over many noisy ones. \
+Each content is ONE concise, self-contained, present-tense sentence, no markdown. \
+scope_hint \"global\" only for facts true across ALL projects (who the user is, cross-project preferences); otherwise \"space\".";
+
+const CLAUDE_MODEL: &str = "claude-haiku-4-5-20251001";
+const CLAUDE_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Strict parsing of `claude -p --output-format json` stdout; bad extractor
+/// output must never reach the store. Handles the `structured_output` field,
+/// a JSON-string `result`, and an object `result`.
+pub fn parse_candidates(stdout: &str) -> Vec<Candidate> {
+    let Ok(envelope) = serde_json::from_str::<serde_json::Value>(stdout) else {
+        return Vec::new();
+    };
+    let mut payload = envelope.get("structured_output").cloned();
+    if payload.is_none() || payload == Some(serde_json::Value::Null) {
+        payload = match envelope.get("result") {
+            Some(serde_json::Value::String(s)) => serde_json::from_str(s).ok(),
+            Some(v @ serde_json::Value::Object(_)) => Some(v.clone()),
+            _ => None,
+        };
+    }
+    let Some(payload) = payload else { return Vec::new() };
+    let list = payload
+        .get("memories")
+        .and_then(|m| m.as_array())
+        .or_else(|| payload.as_array())
+        .cloned()
+        .unwrap_or_default();
+
+    let mut out = Vec::new();
+    for item in list {
+        let Some(content) = item.get("content").and_then(|c| c.as_str()) else { continue };
+        if content.trim().is_empty() {
+            continue;
+        }
+        let Some(mtype) = item.get("type").and_then(|t| t.as_str()).and_then(static_type) else {
+            continue;
+        };
+        out.push(Candidate {
+            mtype,
+            content: content.to_string(),
+            confidence: item.get("confidence").and_then(|c| c.as_f64()).unwrap_or(0.5),
+            scope_hint: if item.get("scope_hint").and_then(|s| s.as_str()) == Some("global") {
+                ScopeHint::Global
+            } else {
+                ScopeHint::Space
+            },
+        });
+    }
+    out
+}
+
+/// Run `claude -p` over a redacted span. Blocking (called from the worker
+/// thread). `None` = claude could not be run at all (caller may fall back);
+/// `Some(vec)` = it ran, possibly finding nothing.
+///
+/// The child claude writes its own transcript under the temp dir's cwd slug —
+/// never a watched project directory — so capture can't re-distill extractor
+/// output into an unbounded model-call loop. (When the P6 `notify` watcher
+/// lands, also register this session id as internal before spawning.)
+pub fn claude_extract(span: &str) -> Option<Vec<Candidate>> {
+    if span.trim().is_empty() {
+        return Some(Vec::new());
+    }
+    let session_id = uuid::Uuid::new_v4().to_string();
+    let mut child = std::process::Command::new("claude")
+        .args([
+            "-p", span,
+            "--session-id", &session_id,
+            "--output-format", "json",
+            "--json-schema", SCHEMA,
+            "--append-system-prompt", SYSTEM,
+            "--model", CLAUDE_MODEL,
+        ])
+        .current_dir(std::env::temp_dir())
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .ok()?;
+
+    let stdout = child.stdout.take()?;
+    let reader = std::thread::spawn(move || {
+        use std::io::Read;
+        let mut out = String::new();
+        let _ = std::io::BufReader::new(stdout).read_to_string(&mut out);
+        out
+    });
+
+    let start = std::time::Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) => {
+                if start.elapsed() > CLAUDE_TIMEOUT {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(150));
+            }
+            Err(_) => break,
+        }
+    }
+    let out = reader.join().unwrap_or_default();
+    Some(parse_candidates(&out))
+}
+
+// --- async extraction worker -------------------------------------------------
+
+pub struct LearnRequest {
+    pub space_id: String,
+    pub span: String,
+    /// Settings value at send time ("claude" | anything else = heuristic).
+    pub tier: String,
+}
+
+pub struct LearnResult {
+    pub space_id: String,
+    pub candidates: Vec<Candidate>,
+}
+
+/// Extraction runs off the UI thread (a claude -p call takes seconds). The
+/// worker redacts + extracts; the app stores results on the UI thread (the db
+/// stays single-writer).
+pub fn start_worker(
+    ctx: Option<egui::Context>,
+) -> (std::sync::mpsc::Sender<LearnRequest>, std::sync::mpsc::Receiver<LearnResult>) {
+    let (req_tx, req_rx) = std::sync::mpsc::channel::<LearnRequest>();
+    let (res_tx, res_rx) = std::sync::mpsc::channel::<LearnResult>();
+    std::thread::Builder::new()
+        .name("zede-extractor".into())
+        .spawn(move || {
+            while let Ok(req) = req_rx.recv() {
+                let clean = redact::redact(&req.span).text;
+                let candidates = if req.tier == "claude" {
+                    // Spawn failure (claude not on PATH) falls back to the
+                    // offline heuristics rather than learning nothing.
+                    claude_extract(&clean).unwrap_or_else(|| extract(&clean))
+                } else {
+                    extract(&clean)
+                };
+                if res_tx
+                    .send(LearnResult { space_id: req.space_id, candidates })
+                    .is_err()
+                {
+                    break;
+                }
+                if let Some(ctx) = &ctx {
+                    ctx.request_repaint();
+                }
+            }
+        })
+        .ok();
+    (req_tx, res_rx)
 }

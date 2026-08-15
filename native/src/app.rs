@@ -47,6 +47,8 @@ pub struct ZedeApp {
     /// How many of each feed's prompts have been through the learn pipeline.
     extracted_upto: HashMap<String, usize>,
     last_learned: Option<(Instant, usize)>,
+    learn_tx: std::sync::mpsc::Sender<extract::LearnRequest>,
+    learn_rx: std::sync::mpsc::Receiver<extract::LearnResult>,
     focus_terminal: bool,
 }
 
@@ -169,6 +171,7 @@ impl ZedeApp {
             .or_else(|| spaces.first().map(|s| s.id.clone()))
             .ok_or("no spaces after seed")?;
 
+        let (learn_tx, learn_rx) = extract::start_worker(Some(cc.egui_ctx.clone()));
         let mut app = ZedeApp {
             db,
             settings,
@@ -192,6 +195,8 @@ impl ZedeApp {
             import_report: None,
             extracted_upto: HashMap::new(),
             last_learned: None,
+            learn_tx,
+            learn_rx,
             focus_terminal: true,
         };
         app.load_tabs();
@@ -571,11 +576,11 @@ impl eframe::App for ZedeApp {
         let th = self.theme;
         let mut pending: Vec<Action> = Vec::new();
 
-        // --- capture: poll the active chat's transcript; learn from new
-        // prompts (redact -> extract -> fingerprint-dedupe -> store) ----------
+        // --- capture: poll the active chat's transcript; queue new prompts
+        // for the extraction worker (redact -> extract off-thread), and store
+        // finished results here (the db stays single-writer) -----------------
         {
             let mut auto_title: Option<(String, String)> = None;
-            let mut learned = 0usize;
             if let Some(tab) = self.current_tab() {
                 if let Some(feed) = self.prompt_feeds.get_mut(&tab.id) {
                     if feed.poll() {
@@ -585,9 +590,16 @@ impl eframe::App for ZedeApp {
                             .copied()
                             .unwrap_or(0)
                             .min(feed.prompts.len());
-                        for prompt in &feed.prompts[upto..] {
-                            learned +=
-                                extract::learn_from_text(&self.db, &self.active_space, &prompt.text);
+                        let new: Vec<String> = feed.prompts[upto..]
+                            .iter()
+                            .map(|p| format!("User: {}", p.text))
+                            .collect();
+                        if !new.is_empty() {
+                            let _ = self.learn_tx.send(extract::LearnRequest {
+                                space_id: self.active_space.clone(),
+                                span: new.join("\n\n"),
+                                tier: self.settings.extraction_tier.clone(),
+                            });
                         }
                         self.extracted_upto.insert(tab.id.clone(), feed.prompts.len());
                     }
@@ -608,6 +620,11 @@ impl eframe::App for ZedeApp {
             if let Some((id, title)) = auto_title {
                 self.db.rename_tab(&id, &title);
                 self.load_tabs();
+            }
+
+            let mut learned = 0usize;
+            while let Ok(result) = self.learn_rx.try_recv() {
+                learned += extract::store_candidates(&self.db, &result.space_id, &result.candidates);
             }
             if learned > 0 {
                 self.last_learned = Some((Instant::now(), learned));

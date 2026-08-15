@@ -7,7 +7,9 @@ license = "MIT"
 repository = "https://github.com/goldinitp/zede"
 
 [dependencies]
-eframe = { version = "0.32", default-features = false, features = ["wgpu", "default_fonts"] }
+# x11/wayland are Linux-only inside winit; enabling them everywhere is how
+# eframe's own defaults work and costs nothing on macOS/Windows.
+eframe = { version = "0.32", default-features = false, features = ["wgpu", "default_fonts", "x11", "wayland"] }
 egui = "0.32"
 # eframe's slim feature set doesn't pick a wgpu backend; enable the native
 # ones here (each is cfg-gated to its platform inside wgpu, so this is safe

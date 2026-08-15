@@ -553,6 +553,75 @@ fn check_learn_pipeline() -> Result<(), String> {
     Ok(())
 }
 
+fn check_claude_envelope_parsing() -> Result<(), String> {
+    use extract::parse_candidates;
+
+    // structured_output envelope (current claude CLI shape).
+    let out = parse_candidates(
+        r#"{"structured_output":{"memories":[
+            {"type":"decision","content":"Ship the rust port","confidence":0.9,"scope_hint":"space"},
+            {"type":"preference","content":"Use pnpm","confidence":0.8,"scope_hint":"global"}
+        ]}}"#,
+    );
+    expect(out.len() == 2, "structured_output envelope parsed")?;
+    expect(out[0].mtype == "decision" && out[1].mtype == "preference", "types mapped")?;
+    expect(
+        out[1].scope_hint == extract::ScopeHint::Global,
+        "global scope hint honored",
+    )?;
+
+    // result-as-JSON-string envelope (older shape).
+    let out = parse_candidates(
+        r#"{"result":"{\"memories\":[{\"type\":\"fact\",\"content\":\"The db is sqlite\",\"confidence\":0.7}]}"}"#,
+    );
+    expect(out.len() == 1 && out[0].mtype == "fact", "result-string envelope parsed")?;
+    expect((out[0].confidence - 0.7).abs() < 1e-9, "confidence carried")?;
+
+    // result-as-object envelope.
+    let out = parse_candidates(
+        r#"{"result":{"memories":[{"type":"todo","content":"Wire the watcher"}]}}"#,
+    );
+    expect(out.len() == 1, "result-object envelope parsed")?;
+    expect((out[0].confidence - 0.5).abs() < 1e-9, "missing confidence defaults to 0.5")?;
+
+    // Hostile/garbage output never reaches the store.
+    let out = parse_candidates(
+        r#"{"structured_output":{"memories":[
+            {"type":"exploit","content":"bad type dropped","confidence":1},
+            {"type":"fact","content":"","confidence":1},
+            {"type":"fact"},
+            "not-an-object"
+        ]}}"#,
+    );
+    expect(out.is_empty(), "invalid types, empty and malformed items dropped")?;
+    expect(parse_candidates("not json").is_empty(), "non-json stdout dropped")?;
+    expect(parse_candidates("{}").is_empty(), "empty envelope dropped")?;
+    Ok(())
+}
+
+fn check_extraction_worker() -> Result<(), String> {
+    let (db, dir) = temp_db()?;
+    let space = db.create_space("Worker", None);
+    let (tx, rx) = extract::start_worker(None);
+    tx.send(extract::LearnRequest {
+        space_id: space.id.clone(),
+        span: "User: we decided to use rusqlite for storage".into(),
+        tier: "heuristic".into(),
+    })
+    .map_err(|e| e.to_string())?;
+    let result = rx
+        .recv_timeout(Duration::from_secs(5))
+        .map_err(|_| "worker did not answer".to_string())?;
+    expect(result.space_id == space.id, "result carries the space")?;
+    expect(!result.candidates.is_empty(), "worker extracted a candidate")?;
+    let stored = extract::store_candidates(&db, &result.space_id, &result.candidates);
+    expect(stored > 0, "worker results store")?;
+    let again = extract::store_candidates(&db, &result.space_id, &result.candidates);
+    expect(again == 0, "re-storing the same result dedupes")?;
+    let _ = std::fs::remove_dir_all(dir);
+    Ok(())
+}
+
 fn mem_row(content: &str, mtype: &str, pinned: bool, salience: Option<f64>) -> MemoryRow {
     MemoryRow {
         id: uuid::Uuid::new_v4().to_string(),
@@ -693,6 +762,8 @@ pub fn run() -> i32 {
         ("memory crud + tombstones", check_memory_crud),
         ("electron db import", check_electron_import),
         ("heuristic extractor", check_heuristic_extractor),
+        ("claude envelope parsing", check_claude_envelope_parsing),
+        ("extraction worker roundtrip", check_extraction_worker),
         ("learn pipeline dedupe + suppression", check_learn_pipeline),
         ("ranker token budget", check_ranker_budget),
         ("context writer + CLAUDE.md wiring", check_context_writer),
