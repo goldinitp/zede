@@ -649,7 +649,7 @@ fn check_ranker_budget() -> Result<(), String> {
             Some(0.9),
         ));
     }
-    let selected = inject::select(&rows, 0);
+    let selected = inject::select(&rows, 0, &std::collections::HashMap::new());
     expect(selected[0].pinned, "pinned row selected first despite low score")?;
     let tokens: usize = selected.iter().map(|r| inject::est_tokens(&r.content)).sum();
     expect(tokens <= 1500 + 600, "selection respects the token budget")?;
@@ -693,6 +693,87 @@ fn check_context_writer() -> Result<(), String> {
         "managed block not duplicated on rewrite",
     )?;
     let _ = std::fs::remove_dir_all(dir);
+    Ok(())
+}
+
+fn check_fts_search() -> Result<(), String> {
+    let dir = std::env::temp_dir().join(format!("zede-selftest-{}", uuid::Uuid::new_v4()));
+    let path = dir.join("zede.db");
+    let (space_id, id);
+    {
+        let db = Db::open(&path)?;
+        expect(db.fts_enabled(), "bundled sqlite has FTS5")?;
+        let space = db.create_space("Fts", None);
+        space_id = space.id.clone();
+        id = db.insert_memory(Some(&space.id), "space", "decision", "the rust port ships this quarter", None, Some("h-fts-1"));
+        db.insert_memory(None, "global", "preference", "always use pnpm here", None, Some("h-fts-2"));
+        db.insert_memory(Some(&space.id), "space", "fact", "totally unrelated words", None, Some("h-fts-3"));
+    }
+    // Simulate a database that predates the index (e.g. one populated by the
+    // Electron importer before FTS existed): wipe the index artifacts, then
+    // reopen — ensure_fts must REBUILD from the content table. A plain
+    // "delta backfill" cannot work on external-content fts5 (non-MATCH
+    // selects read through to the content table), which a trigger-only test
+    // would never catch.
+    {
+        let raw = rusqlite::Connection::open(&path).map_err(|e| e.to_string())?;
+        raw.execute_batch(
+            "DROP TRIGGER memories_ai; DROP TRIGGER memories_ad; DROP TRIGGER memories_au;
+             DROP TABLE memories_fts; DELETE FROM meta WHERE key='fts_built';",
+        )
+        .map_err(|e| e.to_string())?;
+    }
+    let db = Db::open(&path)?;
+    let hits = db.search_fts(&space_id, "\"rust\" OR \"port\"");
+    expect(
+        hits.len() == 1 && hits[0].1 > 0.0,
+        "rebuild indexes pre-existing rows (fts finds the row with positive magnitude)",
+    )?;
+    let rows = db.search_rows(&space_id, "\"pnpm\"", "pnpm");
+    expect(rows.len() == 1 && rows[0].content.contains("pnpm"), "panel search hits global rows")?;
+
+    // Content edits keep the index in sync (v8-style UPDATE OF trigger).
+    let mut row = db.get_memory_sync(&id).ok_or("row exists")?;
+    row.content = "renamed to quantum widgets".into();
+    row.edited_at += 1;
+    db.upsert_synced_memory(&row, 999);
+    expect(db.search_fts(&space_id, "\"rust\"").is_empty(), "old terms leave the index on edit")?;
+    expect(db.search_fts(&space_id, "\"quantum\"").len() == 1, "new terms are searchable")?;
+
+    // Forgotten rows never surface (status filter on the join).
+    db.forget_memory(&id, "test");
+    expect(db.search_fts(&space_id, "\"quantum\"").is_empty(), "tombstoned rows excluded")?;
+
+    // LIKE fallback path (short/unindexed queries) still works.
+    let rows = db.search_rows(&space_id, "", "unrelated");
+    expect(rows.len() == 1, "LIKE fallback finds substring matches")?;
+    let _ = std::fs::remove_dir_all(dir);
+    Ok(())
+}
+
+fn check_match_query() -> Result<(), String> {
+    let q = inject::build_match_query("Hello WORLD x1 the zede-native Hello /Users/goldi");
+    expect(
+        q == "\"hello\" OR \"world\" OR \"the\" OR \"zede\" OR \"native\" OR \"users\" OR \"goldi\"",
+        &format!("tokenized, deduped, quoted, OR-joined (got: {q})"),
+    )?;
+    expect(inject::build_match_query("a b x1").is_empty(), "no 3+ char tokens -> empty expr")?;
+    let many: String = (0..40).map(|i| format!("token{i:02} ")).collect();
+    let q = inject::build_match_query(&many);
+    expect(q.matches(" OR ").count() == 15, "seed tokens cap at 16")?;
+    Ok(())
+}
+
+fn check_ranker_fts_term() -> Result<(), String> {
+    let a = mem_row("alpha memory about the port", "fact", false, Some(0.5));
+    let b = mem_row("beta memory about nothing", "fact", false, Some(0.5));
+    let rows = vec![a.clone(), b.clone()];
+    let mut fts = std::collections::HashMap::new();
+    fts.insert(a.id.clone(), 3.0);
+    let selected = inject::select(&rows, 0, &fts);
+    expect(selected[0].id == a.id, "lexical relevance ranks the seeded row first")?;
+    let selected = inject::select(&rows, 0, &std::collections::HashMap::new());
+    expect(selected.len() == 2, "empty fts map keeps everything rankable")?;
     Ok(())
 }
 
@@ -1017,6 +1098,9 @@ pub fn run() -> i32 {
         ("learn pipeline dedupe + suppression", check_learn_pipeline),
         ("ranker token budget", check_ranker_budget),
         ("context writer + CLAUDE.md wiring", check_context_writer),
+        ("fts index + search", check_fts_search),
+        ("fts match query builder", check_match_query),
+        ("ranker lexical term", check_ranker_fts_term),
         ("sync format roundtrip", check_sync_format_roundtrip),
         ("sync export determinism + redaction", check_sync_export),
         ("sync merge rules", check_sync_merge_rules),

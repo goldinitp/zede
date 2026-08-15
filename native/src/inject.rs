@@ -5,6 +5,7 @@
 //! semantic terms of the score are not yet grafted in — pin, recency,
 //! frequency, scope and salience are).
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use crate::db::MemoryRow;
@@ -43,10 +44,42 @@ fn scope_boost(scope: &str) -> f64 {
     }
 }
 
-fn score(row: &MemoryRow, now_ms: i64) -> f64 {
+/// Turn free text (cwd + space name + tab titles) into a safe FTS5 MATCH
+/// expression: unique lowercase alphanumeric tokens of 3+ chars, quoted,
+/// OR-joined, capped at 16.
+pub fn build_match_query(seed: &str) -> String {
+    let lowered = seed.to_lowercase();
+    let mut tokens: Vec<String> = Vec::new();
+    let mut current = String::new();
+    for c in lowered.chars().chain(std::iter::once(' ')) {
+        if c.is_ascii_alphanumeric() {
+            current.push(c);
+        } else if !current.is_empty() {
+            if current.len() >= 3 && !tokens.contains(&current) {
+                tokens.push(current.clone());
+                if tokens.len() >= 16 {
+                    break;
+                }
+            }
+            current.clear();
+        }
+    }
+    tokens
+        .iter()
+        .map(|t| format!("\"{t}\""))
+        .collect::<Vec<_>>()
+        .join(" OR ")
+}
+
+fn score(row: &MemoryRow, now_ms: i64, fts: &HashMap<String, f64>, fts_worst: f64) -> f64 {
     let mut s = 0.0;
     if row.pinned {
         s += 5.0;
+    }
+    if fts_worst > 0.0 {
+        if let Some(mag) = fts.get(&row.id) {
+            s += 2.0 * (mag / fts_worst);
+        }
     }
     let basis = row
         .last_used_at
@@ -62,9 +95,14 @@ fn score(row: &MemoryRow, now_ms: i64) -> f64 {
 }
 
 /// Greedy token-budget fill: pinned first (capped at a pin sub-budget), then
-/// by score.
-pub fn select(rows: &[MemoryRow], now_ms: i64) -> Vec<MemoryRow> {
-    let mut ranked: Vec<(&MemoryRow, f64)> = rows.iter().map(|r| (r, score(r, now_ms))).collect();
+/// by score. `fts` maps memory id -> bm25 magnitude for the current seed
+/// (empty map = no lexical term).
+pub fn select(rows: &[MemoryRow], now_ms: i64, fts: &HashMap<String, f64>) -> Vec<MemoryRow> {
+    let fts_worst = fts.values().cloned().fold(0.0f64, f64::max);
+    let mut ranked: Vec<(&MemoryRow, f64)> = rows
+        .iter()
+        .map(|r| (r, score(r, now_ms, fts, fts_worst)))
+        .collect();
     ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
     let mut selected: Vec<MemoryRow> = Vec::new();

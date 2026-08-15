@@ -43,6 +43,7 @@ pub struct ZedeApp {
     show_memory: bool,
     memory_rows: Vec<MemoryRow>,
     memory_filter: String,
+    memory_last_filter: String,
     electron_db_available: bool,
     import_report: Option<String>,
     /// How many of each feed's prompts have been through the learn pipeline.
@@ -240,6 +241,7 @@ impl ZedeApp {
             show_memory: false,
             memory_rows: Vec::new(),
             memory_filter: String::new(),
+            memory_last_filter: String::new(),
             electron_db_available: electron_db_path().exists(),
             import_report: None,
             extracted_upto: HashMap::new(),
@@ -281,7 +283,14 @@ impl ZedeApp {
     }
 
     fn reload_memories(&mut self) {
-        self.memory_rows = self.db.list_memories(&self.active_space);
+        let query = self.memory_filter.trim().to_string();
+        self.memory_rows = if query.len() >= 2 {
+            self.db
+                .search_rows(&self.active_space, &inject::build_match_query(&query), &query)
+        } else {
+            self.db.list_memories(&self.active_space)
+        };
+        self.memory_last_filter = self.memory_filter.clone();
     }
 
     fn handle_memory_action(&mut self, action: MemoryAction) {
@@ -353,7 +362,15 @@ impl ZedeApp {
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_millis() as i64)
                 .unwrap_or(0);
-            let selected = inject::select(&rows, now);
+            // Lexical relevance seed: where the session runs + what it's about.
+            let titles: Vec<String> = self.tabs.iter().map(|t| t.title.clone()).collect();
+            let seed = format!("{} {} {}", tab.cwd, space_name, titles.join(" "));
+            let fts: HashMap<String, f64> = self
+                .db
+                .search_fts(&tab.space_id, &inject::build_match_query(&seed))
+                .into_iter()
+                .collect();
+            let selected = inject::select(&rows, now, &fts);
             inject::write_context(&tab.cwd, &selected, &space_name);
         }
 
@@ -823,6 +840,9 @@ impl eframe::App for ZedeApp {
 
         // --- memory sidebar (⌘M) ---------------------------------------------
         if self.show_memory {
+            if self.memory_filter != self.memory_last_filter {
+                self.reload_memories();
+            }
             let mut mem_action = None;
             let rows = &self.memory_rows;
             let filter = &mut self.memory_filter;

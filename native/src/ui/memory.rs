@@ -56,11 +56,8 @@ pub fn memory_panel(
     });
     ui.add_space(8.0);
 
-    let needle = filter.trim().to_lowercase();
-    let visible: Vec<&MemoryRow> = rows
-        .iter()
-        .filter(|m| needle.is_empty() || m.content.to_lowercase().contains(&needle))
-        .collect();
+    // Rows arrive pre-filtered (FTS-ranked when a query is set).
+    let visible: Vec<&MemoryRow> = rows.iter().collect();
 
     if rows.is_empty() {
         ui.add_space(12.0);

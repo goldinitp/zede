@@ -12,6 +12,51 @@ use crate::pty::TabKind;
 
 pub struct Db {
     conn: Connection,
+    has_fts: bool,
+}
+
+// External-content FTS5 over memories.content (ported from the Electron
+// schema v1 + the v8 trigger refinement: UPDATE trigger fires only when
+// content actually changes). Optional accelerator — a build without FTS5
+// still works, search just falls back to LIKE.
+const FTS_SCHEMA: &str = "
+CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(content, content='memories', content_rowid='rowid');
+CREATE TRIGGER IF NOT EXISTS memories_ai AFTER INSERT ON memories BEGIN
+  INSERT INTO memories_fts(rowid, content) VALUES (new.rowid, new.content);
+END;
+CREATE TRIGGER IF NOT EXISTS memories_ad AFTER DELETE ON memories BEGIN
+  INSERT INTO memories_fts(memories_fts, rowid, content) VALUES('delete', old.rowid, old.content);
+END;
+CREATE TRIGGER IF NOT EXISTS memories_au AFTER UPDATE OF content ON memories BEGIN
+  INSERT INTO memories_fts(memories_fts, rowid, content) VALUES('delete', old.rowid, old.content);
+  INSERT INTO memories_fts(rowid, content) VALUES (new.rowid, new.content);
+END;
+";
+
+fn ensure_fts(conn: &Connection) -> bool {
+    if conn.execute_batch(FTS_SCHEMA).is_err() {
+        return false;
+    }
+    // One-time index build for rows that predate the triggers. NOTE: plain
+    // SELECTs on an external-content fts5 table read through to the content
+    // table, so a "delta backfill" via NOT IN always sees nothing to do —
+    // the only correct bulk build is the 'rebuild' command.
+    let built: Option<String> = conn
+        .query_row("SELECT value FROM meta WHERE key = 'fts_built'", [], |r| r.get(0))
+        .ok();
+    if built.as_deref() != Some("1")
+        && conn
+            .execute("INSERT INTO memories_fts(memories_fts) VALUES('rebuild')", [])
+            .is_ok()
+    {
+        conn.execute(
+            "INSERT INTO meta(key, value) VALUES('fts_built', '1')
+             ON CONFLICT(key) DO UPDATE SET value = '1'",
+            [],
+        )
+        .ok();
+    }
+    true
 }
 
 #[derive(Clone, Debug)]
@@ -171,9 +216,14 @@ impl Db {
         // The sync worker opens its own connection; WAL + a busy timeout make
         // the brief cross-thread writes safe.
         conn.busy_timeout(std::time::Duration::from_millis(5000)).ok();
-        let db = Db { conn };
+        let db = Db { conn, has_fts: false };
         db.migrate()?;
-        Ok(db)
+        let has_fts = ensure_fts(&db.conn);
+        Ok(Db { has_fts, ..db })
+    }
+
+    pub fn fts_enabled(&self) -> bool {
+        self.has_fts
     }
 
     fn migrate(&self) -> Result<(), String> {
@@ -468,6 +518,98 @@ impl Db {
             Err(_) => return Vec::new(),
         };
         stmt.query_map([space_id], |r| {
+            Ok(MemoryRow {
+                id: r.get(0)?,
+                space_id: r.get(1)?,
+                scope: r.get(2)?,
+                mtype: r.get(3)?,
+                content: r.get(4)?,
+                pinned: r.get::<_, i64>(5)? != 0,
+                use_count: r.get(6)?,
+                confidence: r.get(7)?,
+                salience: r.get(8)?,
+                created_at: r.get(9)?,
+                updated_at: r.get(10)?,
+                last_used_at: r.get(11)?,
+            })
+        })
+        .map(|rows| rows.filter_map(Result::ok).collect())
+        .unwrap_or_default()
+    }
+
+    /// Lexical relevance for the ranker: (memory id, bm25 magnitude) — larger
+    /// is better. Empty on no FTS, empty expr, or any query error.
+    pub fn search_fts(&self, space_id: &str, match_expr: &str) -> Vec<(String, f64)> {
+        if !self.has_fts || match_expr.trim().is_empty() {
+            return Vec::new();
+        }
+        let Ok(mut stmt) = self.conn.prepare(
+            "SELECT m.id, memories_fts.rank
+             FROM memories_fts JOIN memories m ON m.rowid = memories_fts.rowid
+             WHERE memories_fts MATCH ?1
+               AND (m.space_id = ?2 OR m.space_id IS NULL) AND m.status = 'active'
+             ORDER BY memories_fts.rank LIMIT 200",
+        ) else {
+            return Vec::new();
+        };
+        stmt.query_map(params![match_expr, space_id], |r| {
+            Ok((r.get::<_, String>(0)?, -r.get::<_, f64>(1)?))
+        })
+        .map(|rows| rows.filter_map(Result::ok).collect())
+        .unwrap_or_default()
+    }
+
+    /// Memory-panel search, best first. FTS when available, LIKE otherwise.
+    pub fn search_rows(&self, space_id: &str, match_expr: &str, raw_query: &str) -> Vec<MemoryRow> {
+        if self.has_fts && !match_expr.trim().is_empty() {
+            let Ok(mut stmt) = self.conn.prepare(
+                "SELECT m.id, m.space_id, m.scope, m.type, m.content, m.pinned, m.use_count,
+                        m.confidence, m.salience, m.created_at, m.updated_at, m.last_used_at
+                 FROM memories_fts JOIN memories m ON m.rowid = memories_fts.rowid
+                 WHERE memories_fts MATCH ?1
+                   AND (m.space_id = ?2 OR m.space_id IS NULL) AND m.status = 'active'
+                 ORDER BY memories_fts.rank LIMIT 200",
+            ) else {
+                return Vec::new();
+            };
+            let rows: Vec<MemoryRow> = stmt
+                .query_map(params![match_expr, space_id], |r| {
+                    Ok(MemoryRow {
+                        id: r.get(0)?,
+                        space_id: r.get(1)?,
+                        scope: r.get(2)?,
+                        mtype: r.get(3)?,
+                        content: r.get(4)?,
+                        pinned: r.get::<_, i64>(5)? != 0,
+                        use_count: r.get(6)?,
+                        confidence: r.get(7)?,
+                        salience: r.get(8)?,
+                        created_at: r.get(9)?,
+                        updated_at: r.get(10)?,
+                        last_used_at: r.get(11)?,
+                    })
+                })
+                .map(|rows| rows.filter_map(Result::ok).collect())
+                .unwrap_or_default();
+            if !rows.is_empty() {
+                return rows;
+            }
+            // Fall through to LIKE for prefixes FTS tokenizing misses.
+        }
+        let escaped = raw_query.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_");
+        let pattern = format!("%{escaped}%");
+        let Ok(mut stmt) = self.conn.prepare(
+            "SELECT id, space_id, scope, type, content, pinned, use_count,
+                    confidence, salience, created_at, updated_at, last_used_at
+             FROM memories
+             WHERE (space_id = ?2 OR space_id IS NULL) AND status = 'active'
+               AND content LIKE ?1 ESCAPE '\\'
+             ORDER BY pinned DESC, COALESCE(edited_at, updated_at, created_at) DESC
+             LIMIT 200",
+        ) else {
+            return Vec::new();
+        };
+        stmt.query_map(params![pattern, space_id], |r| {
             Ok(MemoryRow {
                 id: r.get(0)?,
                 space_id: r.get(1)?,
