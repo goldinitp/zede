@@ -7,6 +7,7 @@ use egui::{
     Align2, Color32, CornerRadius, FontId, Rect, RichText, Sense, Stroke, StrokeKind, Ui, Vec2,
 };
 
+use crate::capture::ChatPrompt;
 use crate::db::{SpaceRow, TabRow};
 use crate::pty::TabKind;
 use crate::theme::AppTheme;
@@ -131,6 +132,7 @@ pub fn tab_panel(
     tabs: &[TabRow],
     active_tab: Option<&str>,
     live: &HashMap<String, TabLive>,
+    prompts: Option<&[ChatPrompt]>,
     theme: &AppTheme,
     state: &mut SidebarState,
 ) -> Option<Action> {
@@ -195,7 +197,17 @@ pub fn tab_panel(
     ui.add_space(10.0);
 
     // --- tab rows -----------------------------------------------------------
-    egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+    let show_prompts = prompts.map(|p| !p.is_empty()).unwrap_or(false);
+    let tabs_max_height = if show_prompts {
+        (ui.available_height() * 0.5).max(120.0)
+    } else {
+        f32::INFINITY
+    };
+    egui::ScrollArea::vertical()
+        .id_salt("tab-rows")
+        .max_height(tabs_max_height)
+        .auto_shrink([false, false])
+        .show(ui, |ui| {
         for tab in tabs {
             if let Some((id, mut buf)) = state.renaming_tab.take() {
                 if id == tab.id {
@@ -327,6 +339,63 @@ pub fn tab_panel(
             });
         }
     });
+
+    // --- prompt navigator (this chat's user prompts, newest first) ----------
+    if show_prompts {
+        let prompts = prompts.unwrap_or(&[]);
+        ui.add_space(8.0);
+        ui.horizontal(|ui| {
+            ui.add_space(12.0);
+            ui.label(
+                RichText::new(format!("Prompts · {}", prompts.len()))
+                    .color(theme.chrome.text_3)
+                    .size(11.0)
+                    .strong(),
+            );
+        });
+        ui.add_space(4.0);
+        egui::ScrollArea::vertical()
+            .id_salt("prompt-rows")
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                for prompt in prompts.iter().rev() {
+                    let row_w = ui.available_width();
+                    let (rect, resp) =
+                        ui.allocate_exact_size(Vec2::new(row_w, 24.0), Sense::click());
+                    let row_rect = Rect::from_min_size(
+                        rect.min + Vec2::new(6.0, 1.0),
+                        Vec2::new(row_w - 12.0, 22.0),
+                    );
+                    if resp.hovered() {
+                        ui.painter().rect_filled(
+                            row_rect,
+                            CornerRadius::from(6.0),
+                            theme.chrome.titlebar_2,
+                        );
+                    }
+                    let max_chars = ((row_rect.width() - 20.0) / 6.0).max(4.0) as usize;
+                    let mut text: String = prompt.text.chars().take(max_chars).collect();
+                    if text.chars().count() < prompt.text.chars().count() {
+                        text.push('…');
+                    }
+                    ui.painter().text(
+                        Rect::from_min_size(
+                            row_rect.min + Vec2::new(10.0, 0.0),
+                            Vec2::new(0.0, 22.0),
+                        )
+                        .center(),
+                        Align2::LEFT_CENTER,
+                        text,
+                        FontId::proportional(11.5),
+                        theme.chrome.text_3,
+                    );
+                    if resp.clicked() {
+                        ui.ctx().copy_text(prompt.text.clone());
+                    }
+                    resp.on_hover_text(format!("{}\n\n(click to copy)", prompt.text));
+                }
+            });
+    }
 
     action
 }

@@ -55,8 +55,12 @@ performance. This document is the working plan; `README.md` covers building.
   scrollback / cursor style / blink, restore toggle; live apply; SQLite-backed.
 - **P4 — claude tabs**: session-id spawn, env rules, deterministic transcript
   path recorded per tab, pinned-tab `--resume` on relaunch.
-- **P5 — capture + prompts**: `notify` watcher over `~/.claude/projects`,
-  bounded JSONL parsing (1 MiB reads, complete lines only), prompt navigator.
+- **P5 — capture + prompts**: bounded JSONL parsing (1 MiB reads, complete
+  lines only, meta/sidechain/text-block filters) + prompt navigator in the
+  sidebar (click to copy; first prompt auto-titles a default-named chat). ✅
+  Claude-tab transcript paths are deterministic, so the navigator polls one
+  file per chat (2s stat) — the `notify` watcher over `~/.claude/projects`
+  is only needed for cross-session memory capture and moves to P6.
 - **P6 — memory pipeline**: redact → extract (`claude -p` / heuristic) →
   store; memory sidebar; `.zede/context.md` injection writer; import of the
   existing Electron `loom.db`.
@@ -65,8 +69,8 @@ performance. This document is the working plan; `README.md` covers building.
 - **P8 — packaging**: `.app` bundle + icon + dmg; CI matrix (macOS arm64/x64,
   Windows — ConPTY comes free, Linux); release docs.
 
-P1–P4 are implemented in this crate now; P5+ have seams (`db` schema fields,
-session ids, transcript paths) already in place.
+P1–P5 are implemented in this crate now; P6+ have seams (`db` schema fields,
+session ids, transcript paths, the capture parser) already in place.
 
 ## Deliberate v1 gaps
 

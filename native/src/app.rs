@@ -9,6 +9,7 @@ use std::sync::{Arc, RwLock};
 use alacritty_terminal::vte::ansi::{CursorShape as AnsiCursorShape, CursorStyle as AnsiCursorStyle};
 use egui::{Align2, Color32, CornerRadius, Frame, Key, Modifiers, RichText, Vec2};
 
+use crate::capture::PromptFeed;
 use crate::db::{Db, SpaceRow, TabRow};
 use crate::pty::{self, TabKind};
 use crate::settings::{self, CursorStyleKind, Settings};
@@ -27,6 +28,7 @@ pub struct ZedeApp {
     active_space: String,
     active_tab: HashMap<String, String>,
     sessions: HashMap<String, TermSession>,
+    prompt_feeds: HashMap<String, PromptFeed>,
     spawn_errors: HashMap<String, String>,
     /// Tabs whose next spawn must be fresh (post-crash restart).
     no_resume_once: HashSet<String>,
@@ -153,6 +155,7 @@ impl ZedeApp {
             active_space,
             active_tab: HashMap::new(),
             sessions: HashMap::new(),
+            prompt_feeds: HashMap::new(),
             spawn_errors: HashMap::new(),
             no_resume_once: HashSet::new(),
             sidebar_state: SidebarState::default(),
@@ -232,6 +235,9 @@ impl ZedeApp {
             Ok(session) => {
                 if tab.kind == TabKind::Claude {
                     self.db.set_tab_last_session(&tab.id, &session.session_id);
+                    // Deterministic transcript path -> prompt navigator feed.
+                    let path = pty::transcript_path_for(&tab.cwd, &session.session_id);
+                    self.prompt_feeds.insert(tab.id.clone(), PromptFeed::new(path));
                 }
                 self.sessions.insert(tab.id.clone(), session);
             }
@@ -262,6 +268,7 @@ impl ZedeApp {
             Action::DeleteSpace(id) => {
                 for tab in self.db.list_tabs(&id) {
                     self.sessions.remove(&tab.id);
+                    self.prompt_feeds.remove(&tab.id);
                     self.spawn_errors.remove(&tab.id);
                 }
                 self.db.delete_space(&id);
@@ -303,6 +310,7 @@ impl ZedeApp {
             }
             Action::CloseTab(id) => {
                 self.sessions.remove(&id);
+                self.prompt_feeds.remove(&id);
                 self.spawn_errors.remove(&id);
                 self.no_resume_once.remove(&id);
                 self.db.delete_tab(&id);
@@ -469,6 +477,32 @@ impl eframe::App for ZedeApp {
         let th = self.theme;
         let mut pending: Vec<Action> = Vec::new();
 
+        // --- prompt navigator: poll the active chat's transcript -------------
+        if self.sidebar_visible {
+            let mut auto_title: Option<(String, String)> = None;
+            if let Some(tab) = self.current_tab() {
+                if let Some(feed) = self.prompt_feeds.get_mut(&tab.id) {
+                    feed.poll();
+                    // Default-titled chats take their first prompt as a title.
+                    if tab.title == "New chat" {
+                        if let Some(first) = feed.prompts.first() {
+                            let mut t: String = first.text.chars().take(30).collect();
+                            if first.text.chars().count() > 30 {
+                                t.push('…');
+                            }
+                            auto_title = Some((tab.id.clone(), t));
+                        }
+                    }
+                    // Keep polling alive while the pane is idle.
+                    ctx.request_repaint_after(std::time::Duration::from_secs(2));
+                }
+            }
+            if let Some((id, title)) = auto_title {
+                self.db.rename_tab(&id, &title);
+                self.load_tabs();
+            }
+        }
+
         // --- header bar ------------------------------------------------------
         egui::TopBottomPanel::top("header")
             .exact_height(36.0)
@@ -539,6 +573,12 @@ impl eframe::App for ZedeApp {
                     }
                 }
                 let active_tab = self.active_tab.get(&self.active_space).cloned();
+                let prompts = active_tab
+                    .as_deref()
+                    .and_then(|id| self.prompt_feeds.get(id))
+                    .map(|f| f.prompts.as_slice());
+                let sidebar_state = &mut self.sidebar_state;
+                let tabs = &self.tabs;
                 egui::SidePanel::left("tabs")
                     .default_width(212.0)
                     .width_range(170.0..=320.0)
@@ -547,11 +587,12 @@ impl eframe::App for ZedeApp {
                         if let Some(a) = sidebar::tab_panel(
                             ui,
                             &space,
-                            &self.tabs,
+                            tabs,
                             active_tab.as_deref(),
                             &live,
+                            prompts,
                             th,
-                            &mut self.sidebar_state,
+                            sidebar_state,
                         ) {
                             pending.push(a);
                         }

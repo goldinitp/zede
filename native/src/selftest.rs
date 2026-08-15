@@ -8,6 +8,7 @@ use alacritty_terminal::vte::ansi::{CursorShape, CursorStyle};
 use egui::Color32;
 
 use crate::app::osc_from_theme;
+use crate::capture::{prompt_from_line, PromptFeed};
 use crate::db::Db;
 use crate::pty::{self, TabKind};
 use crate::settings::{normalize_setting_value, Settings};
@@ -275,6 +276,99 @@ fn check_shell_detection() -> Result<(), String> {
     Ok(())
 }
 
+fn check_prompt_parser_filters() -> Result<(), String> {
+    expect(
+        prompt_from_line(r#"{"type":"user","message":{"content":"hello world"}}"#)
+            == Some("hello world".into()),
+        "plain user string prompt",
+    )?;
+    expect(
+        prompt_from_line(
+            r#"{"type":"user","message":{"content":[{"type":"text","text":"from blocks"}]}}"#,
+        ) == Some("from blocks".into()),
+        "text-block prompt",
+    )?;
+    expect(
+        prompt_from_line(r#"{"type":"user","isMeta":true,"message":{"content":"m"}}"#).is_none(),
+        "isMeta filtered",
+    )?;
+    expect(
+        prompt_from_line(r#"{"type":"user","isSidechain":true,"message":{"content":"s"}}"#)
+            .is_none(),
+        "isSidechain filtered",
+    )?;
+    expect(
+        prompt_from_line(r#"{"type":"assistant","message":{"content":"a"}}"#).is_none(),
+        "assistant filtered",
+    )?;
+    expect(
+        prompt_from_line(
+            r#"{"type":"user","message":{"content":[{"type":"tool_result","content":"x"}]}}"#,
+        )
+        .is_none(),
+        "tool_result-only filtered",
+    )?;
+    expect(
+        prompt_from_line(
+            r#"{"type":"user","message":{"content":"<command-name>/foo</command-name>"}}"#,
+        )
+        .is_none(),
+        "command echo filtered",
+    )?;
+    expect(prompt_from_line("not json at all").is_none(), "garbage line filtered")?;
+    let long = format!(
+        r#"{{"type":"user","message":{{"content":"{}"}}}}"#,
+        "x".repeat(500)
+    );
+    let capped = prompt_from_line(&long).ok_or("long prompt parsed")?;
+    expect(
+        capped.chars().count() == 281 && capped.ends_with('…'),
+        "giant prompt capped with ellipsis",
+    )?;
+    Ok(())
+}
+
+fn check_prompt_feed_incremental() -> Result<(), String> {
+    use std::io::Write;
+    let dir = std::env::temp_dir().join(format!("zede-selftest-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let path = dir.join("session.jsonl");
+
+    let mut f = std::fs::File::create(&path).map_err(|e| e.to_string())?;
+    write!(
+        f,
+        "{}\n{}\n{}",
+        r#"{"type":"user","message":{"content":"first"}}"#,
+        r#"{"type":"assistant","message":{"content":[{"type":"text","text":"reply"}]}}"#,
+        r#"{"type":"user","message":{"content":"sec"#, // incomplete line, no newline
+    )
+    .map_err(|e| e.to_string())?;
+    f.flush().ok();
+
+    let mut feed = PromptFeed::new(path.clone());
+    expect(feed.poll_now(), "first poll finds the complete prompt")?;
+    expect(
+        feed.prompts.iter().map(|p| p.text.as_str()).collect::<Vec<_>>() == vec!["first"],
+        "incomplete trailing line is not consumed",
+    )?;
+    expect(!feed.poll_now(), "no new complete lines -> no change")?;
+
+    let mut f = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&path)
+        .map_err(|e| e.to_string())?;
+    write!(f, "{}", "ond\"}}\n").map_err(|e| e.to_string())?;
+    f.flush().ok();
+    expect(feed.poll_now(), "completing the line yields the prompt")?;
+    expect(
+        feed.prompts.iter().map(|p| p.text.as_str()).collect::<Vec<_>>()
+            == vec!["first", "second"],
+        "split-across-polls line parsed once complete",
+    )?;
+    let _ = std::fs::remove_dir_all(dir);
+    Ok(())
+}
+
 #[cfg(unix)]
 fn check_pty_end_to_end() -> Result<(), String> {
     let osc = Arc::new(RwLock::new(osc_from_theme(theme::theme_by_id("one-dark"))));
@@ -335,6 +429,8 @@ pub fn run() -> i32 {
         ("key encoding", check_key_encoding),
         ("color math", check_color_math),
         ("shell process detection", check_shell_detection),
+        ("prompt parser filters", check_prompt_parser_filters),
+        ("prompt feed incremental reads", check_prompt_feed_incremental),
     ];
     #[cfg(unix)]
     {
